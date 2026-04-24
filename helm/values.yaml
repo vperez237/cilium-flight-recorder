@@ -220,6 +220,48 @@ service:
   annotations: {}
 
 # --------------------------------------------------------------------------
+# NetworkPolicy — off by default so clusters without a CNI-enforced policy
+# controller aren't forced to turn it on. When enabled, restricts ingress
+# to /metrics + /capture traffic from the listed selectors and allows
+# egress to DNS, Hubble Relay, S3/STS (443), and optionally the OTel
+# collector.
+# --------------------------------------------------------------------------
+networkPolicy:
+  enabled: false
+  # -- Namespace/pod selectors allowed to scrape /metrics. Leave empty
+  # -- to block scraping entirely.
+  scrapeFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  # -- Namespace/pod selectors allowed to hit /capture, /captures, /ready.
+  apiFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+  # -- Pod/service CIDRs of the cluster, excluded from the "allow external
+  # -- 443" egress rule so pod-to-pod 443 traffic still requires an
+  # -- explicit rule. Set to match your CNI config.
+  clusterCIDRs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+
+# --------------------------------------------------------------------------
+# PrometheusRule — requires the Prometheus Operator CRD. Off by default.
+# Rendered rules alert on the circuit breaker opening, Hubble
+# disconnection, sustained S3 upload failures, flow drops, and total
+# capture failure. Tune `interval` / `for:` windows and severity labels
+# for your on-call routing.
+# --------------------------------------------------------------------------
+prometheusRule:
+  enabled: false
+  interval: 30s
+  # Extra labels copied onto the PrometheusRule (useful for
+  # Prometheus Operator's ruleSelector matching).
+  labels: {}
+
+# --------------------------------------------------------------------------
 # Security context — flight-recorder runs unprivileged. It only needs
 # read-only access to the host BPF filesystem and the Cilium agent socket.
 # --------------------------------------------------------------------------

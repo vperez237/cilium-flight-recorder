@@ -69,6 +69,12 @@ spec:
             - name: config
               mountPath: /etc/flight-recorder
               readOnly: true
+            # readOnly on the volume mount only restricts filesystem writes
+            # to /var/run/cilium from inside the pod; it does not prevent
+            # read/write I/O over an open Unix-domain socket, which the
+            # recorder API (PUT/DELETE) uses bidirectionally. Keeping this
+            # read-only is the right default — don't flip to false unless
+            # you understand why you need to.
             - name: cilium-socket
               mountPath: /var/run/cilium
               readOnly: true

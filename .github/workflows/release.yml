@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    # Matches v0.1.0, v1.2.3-rc1, etc. Semver-compatible tags only.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+  packages: write       # push to ghcr.io/<owner>/<repo>
+
+jobs:
+  image:
+    name: Build and push flight-recorder image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: meta
+        run: |
+          # v0.1.0 -> 0.1.0; preserve pre-release suffixes like -rc1 verbatim.
+          echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: flight-recorder
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/flight-recorder:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/flight-recorder:latest
+          # Inline cache keeps subsequent tag builds fast without needing
+          # a separate cache registry.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+
+  chart:
+    name: Package and push Helm chart
+    runs-on: ubuntu-latest
+    needs: image
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+
+      - name: Extract version
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
+
+      - name: Login to GHCR for OCI push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Package + push
+        run: |
+          # Rewrite version/appVersion in the chart to match the tag before
+          # packaging. The chart stays at 0.1.0 in main; releases get the
+          # real version stamped in.
+          sed -i "s/^version: .*/version: ${{ steps.meta.outputs.version }}/" helm/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"${{ steps.meta.outputs.version }}\"/" helm/Chart.yaml
+          helm package helm
+          helm push flight-recorder-${{ steps.meta.outputs.version }}.tgz \
+            oci://ghcr.io/${{ github.repository_owner }}/charts
