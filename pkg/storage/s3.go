@@ -15,6 +15,22 @@ import (
 	"github.com/vperez237/cilium-flight-recorder/pkg/capture"
 	"github.com/vperez237/cilium-flight-recorder/pkg/config"
 	"github.com/vperez237/cilium-flight-recorder/pkg/metrics"
+	"github.com/vperez237/cilium-flight-recorder/pkg/tracing"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// Sentinel errors for S3 uploads. Callers can distinguish transient failures
+// (worth retrying or alerting softly) from terminal ones (operator action
+// needed) via errors.Is.
+var (
+	// ErrS3Transient wraps an error from an individual upload attempt that
+	// may succeed on retry (network blip, 5xx, throttling).
+	ErrS3Transient = errors.New("s3 upload: transient failure")
+	// ErrS3Terminal wraps the final error after all retry attempts are
+	// exhausted, or when ctx was cancelled.
+	ErrS3Terminal = errors.New("s3 upload: terminal failure")
 )
 
 // S3Uploader watches for completed PCAP files and uploads them to S3.
@@ -65,25 +81,44 @@ func NewS3Uploader(ctx context.Context, bucket, region, cluster, endpoint string
 // with jittered exponential backoff. Returns the last error if all attempts
 // fail; the caller is responsible for deciding what to do with the local file.
 func (u *S3Uploader) Upload(ctx context.Context, result capture.CaptureResult) error {
+	ctx, span := tracing.Tracer().Start(ctx, "s3.Upload",
+		trace.WithAttributes(
+			attribute.String("trigger", string(result.Trigger)),
+			attribute.String("bucket", u.bucket),
+			attribute.String("cluster", u.cluster),
+			attribute.String("node", u.nodeName),
+		),
+	)
+	defer span.End()
+
 	initial := time.Duration(u.retryCfg.InitialBackoffMs) * time.Millisecond
 	maxBackoff := time.Duration(u.retryCfg.MaxBackoffMs) * time.Millisecond
 	start := time.Now()
 
 	var lastErr error
 	for attempt := 1; attempt <= u.retryCfg.MaxAttempts; attempt++ {
-		size, err := u.upload(ctx, result)
+		attemptCtx, attemptSpan := tracing.Tracer().Start(ctx, "s3.Upload.attempt",
+			trace.WithAttributes(attribute.Int("attempt", attempt)),
+		)
+		size, err := u.upload(attemptCtx, result)
 		if err == nil {
+			attemptSpan.SetAttributes(attribute.Int64("size_bytes", size))
+			attemptSpan.End()
+			span.SetAttributes(attribute.Int("attempts", attempt), attribute.Int64("size_bytes", size))
 			metrics.UploadAttempts.WithLabelValues("success").Inc()
 			metrics.RecordUploadSuccess(time.Since(start).Seconds(), float64(size))
 			return nil
 		}
+		attemptSpan.RecordError(err)
+		attemptSpan.SetStatus(codes.Error, "attempt failed")
+		attemptSpan.End()
 		lastErr = err
 
 		// Never retry if the caller is shutting down.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			metrics.UploadAttempts.WithLabelValues("terminal").Inc()
 			metrics.RecordUploadFailure()
-			return err
+			return fmt.Errorf("%w: %w", ErrS3Terminal, err)
 		}
 		if attempt == u.retryCfg.MaxAttempts {
 			metrics.UploadAttempts.WithLabelValues("terminal").Inc()
@@ -109,7 +144,9 @@ func (u *S3Uploader) Upload(ctx context.Context, result capture.CaptureResult) e
 		}
 	}
 
-	return fmt.Errorf("upload failed after %d attempts: %w", u.retryCfg.MaxAttempts, lastErr)
+	span.RecordError(lastErr)
+	span.SetStatus(codes.Error, "all upload attempts failed")
+	return fmt.Errorf("%w: after %d attempts: %w", ErrS3Terminal, u.retryCfg.MaxAttempts, lastErr)
 }
 
 // backoffFor returns initial * 2^(attempt-1) capped at max, with ±20% jitter.
@@ -162,13 +199,13 @@ func (u *S3Uploader) Run(ctx context.Context, results <-chan capture.CaptureResu
 func (u *S3Uploader) upload(ctx context.Context, result capture.CaptureResult) (int64, error) {
 	f, err := os.Open(result.FilePath)
 	if err != nil {
-		return 0, fmt.Errorf("opening PCAP file: %w", err)
+		return 0, fmt.Errorf("%w: opening PCAP file: %w", ErrS3Transient, err)
 	}
 	defer f.Close()
 
 	stat, err := f.Stat()
 	if err != nil {
-		return 0, fmt.Errorf("stat PCAP file: %w", err)
+		return 0, fmt.Errorf("%w: stat PCAP file: %w", ErrS3Transient, err)
 	}
 	fileSize := stat.Size()
 
@@ -203,7 +240,7 @@ func (u *S3Uploader) upload(ctx context.Context, result capture.CaptureResult) (
 		Metadata:      metadata,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("uploading to S3: %w", err)
+		return 0, fmt.Errorf("%w: uploading to S3: %w", ErrS3Transient, err)
 	}
 
 	u.logger.Info("uploaded PCAP to S3",

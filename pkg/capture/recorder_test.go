@@ -20,6 +20,13 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+func testCiliumCfg() config.CiliumConfig {
+	return config.CiliumConfig{
+		CircuitFailureThreshold: 3,
+		CircuitCooldownSeconds:  1,
+	}
+}
+
 // mockCiliumAgent creates a Unix socket HTTP server that mimics the Cilium agent recorder API.
 type mockCiliumAgent struct {
 	listener net.Listener
@@ -91,7 +98,7 @@ func TestCaptureManagerCreatesRecorder(t *testing.T) {
 		CooldownSeconds:        0,
 	}
 
-	cm, err := NewCaptureManager(socketPath, outputDir, cfg, testLogger())
+	cm, err := NewCaptureManager(socketPath, outputDir, cfg, testCiliumCfg(), testLogger())
 	if err != nil {
 		t.Fatalf("failed to create capture manager: %v", err)
 	}
@@ -157,7 +164,7 @@ func TestCaptureManagerRespectsMaxConcurrent(t *testing.T) {
 		CooldownSeconds:        0,
 	}
 
-	cm, err := NewCaptureManager(socketPath, outputDir, cfg, testLogger())
+	cm, err := NewCaptureManager(socketPath, outputDir, cfg, testCiliumCfg(), testLogger())
 	if err != nil {
 		t.Fatalf("failed to create capture manager: %v", err)
 	}

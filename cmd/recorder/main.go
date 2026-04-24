@@ -8,14 +8,20 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/vperez237/cilium-flight-recorder/pkg/api"
 	"github.com/vperez237/cilium-flight-recorder/pkg/capture"
 	"github.com/vperez237/cilium-flight-recorder/pkg/config"
 	"github.com/vperez237/cilium-flight-recorder/pkg/detector"
 	"github.com/vperez237/cilium-flight-recorder/pkg/storage"
+	"github.com/vperez237/cilium-flight-recorder/pkg/tracing"
 	"github.com/vperez237/cilium-flight-recorder/pkg/watcher"
 )
+
+// version is stamped at build time via -ldflags. Defaults to "dev" for
+// local/developer builds; shipped in span resource attributes and logs.
+var version = "dev"
 
 const pcapOutputDir = "/tmp/flight-recorder"
 
@@ -35,6 +41,19 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	tracerShutdown, err := tracing.Init(ctx, cfg.Tracing.Endpoint, "flight-recorder", version, cfg.Tracing.SampleRatio)
+	if err != nil {
+		// A tracing misconfiguration shouldn't block the pipeline — log it
+		// and continue with the default no-op tracer.
+		slog.Warn("tracing init failed; running without tracing", "error", err)
+		tracerShutdown = func(context.Context) error { return nil }
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tracerShutdown(shutdownCtx)
+	}()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -47,7 +66,7 @@ func main() {
 
 	ad := detector.NewAnomalyDetector(cfg.Triggers, cfg.Capture.CooldownSeconds, cfg.Detector, logger)
 
-	cm, err := capture.NewCaptureManager(cfg.CiliumSocketPath, pcapOutputDir, cfg.Capture, logger)
+	cm, err := capture.NewCaptureManager(cfg.CiliumSocketPath, pcapOutputDir, cfg.Capture, cfg.Cilium, logger)
 	if err != nil {
 		slog.Error("failed to create capture manager", "error", err)
 		os.Exit(1)

@@ -1,9 +1,34 @@
 package storage
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
+
+func TestSentinelErrorsChain(t *testing.T) {
+	// Transient errors wrapped by Upload() as terminal after retries should
+	// be identifiable as BOTH via errors.Is — callers can filter at either
+	// granularity.
+	inner := errors.New("network timeout")
+	transient := fmt.Errorf("%w: %w", ErrS3Transient, inner)
+	terminal := fmt.Errorf("%w: after 5 attempts: %w", ErrS3Terminal, transient)
+
+	if !errors.Is(terminal, ErrS3Terminal) {
+		t.Error("final error should be ErrS3Terminal")
+	}
+	if !errors.Is(terminal, ErrS3Transient) {
+		t.Error("final error should still carry ErrS3Transient in its chain")
+	}
+	if !errors.Is(terminal, inner) {
+		t.Error("final error should still wrap the innermost cause")
+	}
+	// A pure transient (not yet wrapped as terminal) should not match terminal.
+	if errors.Is(transient, ErrS3Terminal) {
+		t.Error("transient-only error should not match ErrS3Terminal")
+	}
+}
 
 func TestBackoffFor(t *testing.T) {
 	initial := 100 * time.Millisecond

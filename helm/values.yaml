@@ -33,6 +33,11 @@ cilium:
   socketPath: /var/run/cilium/cilium.sock
   # -- Path to the BPF filesystem mount on the node
   bpfPath: /sys/fs/bpf
+  # -- Circuit breaker: open after this many consecutive failures talking to
+  # -- the Cilium agent socket
+  circuitFailureThreshold: 3
+  # -- How long the breaker stays open before admitting a probe request
+  circuitCooldownSeconds: 10
 
 # --------------------------------------------------------------------------
 # Anomaly triggers — each supports `immediate` (fire on every event) or
@@ -121,6 +126,18 @@ upload:
   maxBackoffMs: 30000
 
 # --------------------------------------------------------------------------
+# OpenTelemetry tracing. Leave endpoint empty to disable tracing entirely
+# (no-op tracer, zero runtime overhead). When set, spans cover the capture
+# lifecycle (create/wait/stop recorder) and the S3 upload with per-attempt
+# child spans — great for answering "why did this capture take 15s?".
+# --------------------------------------------------------------------------
+tracing:
+  # -- OTLP gRPC endpoint, e.g. otel-collector.kube-system.svc:4317
+  endpoint: ""
+  # -- Sampling ratio (0.0–1.0). 1.0 = sample every trace.
+  sampleRatio: 1.0
+
+# --------------------------------------------------------------------------
 # Kubernetes resources
 # --------------------------------------------------------------------------
 serviceAccount:
@@ -135,12 +152,19 @@ serviceAccount:
 rbac:
   create: true
 
+# -- Per-pod resources.
+# Typical usage on a node streaming ~5k flows/sec is well under 100Mi /
+# 50m CPU. The memory limit is the main safety rail because the detector's
+# per-tuple rate windows grow with unique (src,dst) pairs — the janitor keeps
+# that bounded (see detector.maxTrackedKeys) but you want headroom.
+# CPU limits are intentionally omitted: for a latency-sensitive, event-driven
+# workload, throttling is usually worse than bursting.
 resources:
   requests:
     cpu: 50m
     memory: 128Mi
   limits:
-    memory: 256Mi
+    memory: 512Mi
 
 # -- Labels applied to the DaemonSet pods (in addition to the default labels)
 podLabels: {}
