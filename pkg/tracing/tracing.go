@@ -53,10 +53,14 @@ func Init(ctx context.Context, endpoint, serviceName, serviceVersion string, sam
 		return nil, fmt.Errorf("create OTLP exporter: %w", err)
 	}
 
+	// Build the resource schemaless so the merge with resource.Default()
+	// doesn't conflict with whatever semconv version the installed SDK
+	// pins (the SDK default carries a schema URL; pinning our attributes
+	// to v1.26.0's SchemaURL caused resource.Merge to refuse mismatched
+	// schemas when the SDK moved to 1.40.0).
 	res, err := resource.Merge(
 		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
+		resource.NewSchemaless(
 			semconv.ServiceName(serviceName),
 			semconv.ServiceVersion(serviceVersion),
 		),
@@ -66,7 +70,11 @@ func Init(ctx context.Context, endpoint, serviceName, serviceVersion string, sam
 	}
 
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp, sdktrace.WithBatchTimeout(5*time.Second)),
+		// 1s batch timeout keeps the local-dev feedback loop tight: a capture
+		// that runs for N seconds should show up in Jaeger within N+1s, not
+		// N+6s. For high-volume production you'd want a larger window (5–10s)
+		// to amortize network overhead.
+		sdktrace.WithBatcher(exp, sdktrace.WithBatchTimeout(time.Second)),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRatio))),
 		sdktrace.WithResource(res),
 	)
