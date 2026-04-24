@@ -7,16 +7,22 @@ A Go-based DaemonSet that monitors Cilium/Hubble flows for anomalies and automat
 ```mermaid
 flowchart TB
     subgraph eachNode [Per-Node DaemonSet]
-        HubbleClient["Hubble gRPC Client"] -->|"flow events"| Detector["Anomaly Detector"]
-        ManualAPI["HTTP API :8080"] -->|"manual trigger"| CaptureManager
+        HubbleClient["Hubble gRPC Client"] -->|"flow events"| Detector["Anomaly Detector<br/>(+ janitor)"]
+        HTTPAPI["HTTP API :8080<br/>/capture · /captures<br/>/health · /ready · /metrics"] -->|"manual trigger"| CaptureManager
         Detector -->|"trigger capture"| CaptureManager["Capture Manager"]
-        CaptureManager -->|"start/stop"| CiliumAPI["Cilium Agent API\n(Unix Socket)"]
-        CaptureManager -->|"completed .pcap"| Uploader["S3 Uploader"]
+        CaptureManager -->|"start/stop<br/>(circuit breaker)"| CiliumAPI["Cilium Agent API<br/>(Unix Socket)"]
+        CaptureManager -->|"completed .pcap"| Uploader["S3 Uploader<br/>(retry + local fallback)"]
     end
 
-    HubbleRelay["Hubble Relay\n(cluster-wide)"] -.->|"gRPC stream"| HubbleClient
+    HubbleRelay["Hubble Relay<br/>(cluster-wide)"] -.->|"gRPC stream"| HubbleClient
     CiliumAPI -->|"BPF recorder maps"| Datapath["Cilium eBPF Datapath"]
     Uploader -->|"PutObject"| S3["S3 Bucket"]
+
+    Prom["Prometheus"] -.->|"scrape /metrics"| HTTPAPI
+    HTTPAPI -.->|"OTLP gRPC"| Otel["Jaeger / OTel Collector"]
+
+    classDef external fill:#f5f5f5,stroke:#999,stroke-dasharray:4 2;
+    class HubbleRelay,Prom,Otel,S3,Datapath external;
 ```
 
 ### Anomaly Triggers
