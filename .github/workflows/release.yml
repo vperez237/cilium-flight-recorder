@@ -19,8 +19,12 @@ jobs:
       - name: Extract version
         id: meta
         run: |
-          # v0.1.0 -> 0.1.0; preserve pre-release suffixes like -rc1 verbatim.
-          echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
+          # Two forms of the version are needed downstream:
+          #   semver:  0.1.0     — Helm chart versions disallow the `v` prefix
+          #   tag:     v0.1.0    — the canonical form for container image tags
+          # Pre-release suffixes like -rc1 are preserved verbatim in both.
+          echo "tag=${GITHUB_REF_NAME}" >>"$GITHUB_OUTPUT"
+          echo "semver=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -37,8 +41,12 @@ jobs:
           target: flight-recorder
           platforms: linux/amd64,linux/arm64
           push: true
+          # Publish under both naming conventions so `image.tag: v0.1.0`
+          # (cloud-native convention) and `image.tag: 0.1.0` (Helm
+          # chart-version alignment) both resolve to the same digest.
           tags: |
-            ghcr.io/${{ github.repository_owner }}/flight-recorder:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/flight-recorder:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/flight-recorder:${{ steps.meta.outputs.semver }}
             ghcr.io/${{ github.repository_owner }}/flight-recorder:latest
           # Inline cache keeps subsequent tag builds fast without needing
           # a separate cache registry.
@@ -47,7 +55,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.tag }}
 
   chart:
     name: Package and push Helm chart
@@ -62,7 +70,8 @@ jobs:
 
       - name: Extract version
         id: meta
-        run: echo "version=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
+        # Chart versions must be strict SemVer (no `v` prefix).
+        run: echo "semver=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
 
       - name: Login to GHCR for OCI push
         run: |
@@ -74,8 +83,8 @@ jobs:
           # Rewrite version/appVersion in the chart to match the tag before
           # packaging. The chart stays at 0.1.0 in main; releases get the
           # real version stamped in.
-          sed -i "s/^version: .*/version: ${{ steps.meta.outputs.version }}/" helm/Chart.yaml
-          sed -i "s/^appVersion: .*/appVersion: \"${{ steps.meta.outputs.version }}\"/" helm/Chart.yaml
+          sed -i "s/^version: .*/version: ${{ steps.meta.outputs.semver }}/" helm/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"${{ steps.meta.outputs.semver }}\"/" helm/Chart.yaml
           helm package helm
-          helm push flight-recorder-${{ steps.meta.outputs.version }}.tgz \
+          helm push flight-recorder-${{ steps.meta.outputs.semver }}.tgz \
             oci://ghcr.io/${{ github.repository_owner }}/charts

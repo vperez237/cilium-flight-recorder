@@ -569,7 +569,15 @@ repo. You'll need, at minimum:
 
 Tagged releases publish a multi-arch image (linux/amd64 + linux/arm64) to
 GitHub Container Registry via the `.github/workflows/release.yml`
-workflow. To use the published image:
+workflow. Each release pushes three tags for the same digest:
+
+| Tag | Example | Use case |
+|---|---|---|
+| `v<semver>` | `v0.1.0` | Cloud-native convention, matches the Git tag |
+| `<semver>` | `0.1.0` | Exact match for the Helm chart version |
+| `latest` | `latest` | Tracks the most recent release (avoid in production) |
+
+To use the published image:
 
 ```yaml
 image:
