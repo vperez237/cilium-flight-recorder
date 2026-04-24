@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on the same branch/PR when a new commit arrives —
+# cheaper than letting stale runs complete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go build + vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # setup-go caches ~/go/pkg/mod and the build cache by default when
+          # go.sum is present. Explicit go-version-file keeps us in sync with
+          # whatever the module file pins.
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        # -race catches data races in the goroutine-heavy detector/capture
+        # paths that a plain `go test` would miss.
+        run: go test -race -count=1 ./...
+
+  helm:
+    name: Helm lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+
+      - name: helm lint
+        run: helm lint helm
+
+      - name: helm template (default values)
+        run: helm template flight-recorder helm >/dev/null
+
+      - name: helm template (example overlay)
+        run: helm template flight-recorder helm -f helm/values-example.yaml >/dev/null

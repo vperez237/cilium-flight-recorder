@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,8 +32,29 @@ func testCiliumCfg() config.CiliumConfig {
 type mockCiliumAgent struct {
 	listener net.Listener
 	server   *http.Server
-	created  []recorderConfig
-	deleted  []int64
+
+	mu      sync.Mutex
+	created []recorderConfig
+	deleted []int64
+}
+
+// Created returns a defensive copy so tests can inspect the slice without
+// racing against concurrent appends from the HTTP handler goroutine.
+func (m *mockCiliumAgent) Created() []recorderConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]recorderConfig, len(m.created))
+	copy(out, m.created)
+	return out
+}
+
+// Deleted returns a defensive copy of the recorded DELETE calls.
+func (m *mockCiliumAgent) Deleted() []int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]int64, len(m.deleted))
+	copy(out, m.deleted)
+	return out
 }
 
 func newMockCiliumAgent(t *testing.T, socketPath string) *mockCiliumAgent {
@@ -50,11 +72,15 @@ func newMockCiliumAgent(t *testing.T, socketPath string) *mockCiliumAgent {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
+			m.mu.Lock()
 			m.created = append(m.created, cfg)
+			m.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 
 		case http.MethodDelete:
+			m.mu.Lock()
 			m.deleted = append(m.deleted, 0)
+			m.mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 
 		default:
@@ -123,11 +149,12 @@ func TestCaptureManagerCreatesRecorder(t *testing.T) {
 	// Give time for the capture goroutine to start and call the API
 	time.Sleep(500 * time.Millisecond)
 
-	if len(mock.created) == 0 {
+	created := mock.Created()
+	if len(created) == 0 {
 		t.Fatal("expected recorder to be created via Cilium API, got none")
 	}
 
-	rc := mock.created[0]
+	rc := created[0]
 	if len(rc.Filters) != 1 {
 		t.Fatalf("expected 1 filter, got %d", len(rc.Filters))
 	}
@@ -192,8 +219,8 @@ func TestCaptureManagerRespectsMaxConcurrent(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// With MaxConcurrent=1, only 1 should have been created
-	if len(mock.created) > 1 {
-		t.Logf("note: %d recorders created (only 1 expected with MaxConcurrent=1)", len(mock.created))
+	if n := len(mock.Created()); n > 1 {
+		t.Logf("note: %d recorders created (only 1 expected with MaxConcurrent=1)", n)
 	}
 
 	cancel()
