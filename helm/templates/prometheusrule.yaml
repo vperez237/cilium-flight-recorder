@@ -1,0 +1,95 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "flight-recorder.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flight-recorder.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: flight-recorder.rules
+      interval: {{ .Values.prometheusRule.interval }}
+      rules:
+        # Cilium agent unreachable — captures can't start. Fires fast
+        # because captures pile up behind the circuit breaker when it's open.
+        - alert: FlightRecorderCiliumCircuitOpen
+          expr: flight_recorder_cilium_circuit_state == 1
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Cilium agent circuit breaker is open on {{ "{{" }} $labels.instance {{ "}}" }}"
+            description: |
+              The flight-recorder's Cilium-socket circuit breaker has been open
+              for over 2 minutes. Captures are failing fast. Check whether the
+              Cilium agent is running on this node and whether its BPF recorder
+              API is reachable.
+
+        # Hubble stream down. After ~5m we're missing flows entirely;
+        # detection goes silent.
+        - alert: FlightRecorderHubbleDisconnected
+          expr: flight_recorder_hubble_connected == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Flight recorder not connected to Hubble on {{ "{{" }} $labels.instance {{ "}}" }}"
+            description: |
+              flight_recorder_hubble_connected has been 0 for over 5 minutes.
+              Verify hubble-relay is healthy and the address in the chart is
+              reachable from this node.
+
+        # S3 uploads failing terminally. Means PCAPs are piling up on local
+        # disk (bounded by the tmpDir emptyDir size) — once that fills, new
+        # captures will start failing on copy.
+        - alert: FlightRecorderS3UploadsFailing
+          expr: |
+            sum(rate(flight_recorder_uploads_total{status="failure"}[10m])) by (instance)
+              > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Flight recorder S3 uploads failing on {{ "{{" }} $labels.instance {{ "}}" }}"
+            description: |
+              More than 1 upload per 10s is failing all retries.
+              Check IRSA credentials, bucket policy, and
+              flight_recorder_upload_attempts_total{outcome="terminal"}.
+
+        # Flows dropped because the consumer channel filled up. Sustained
+        # drops mean the detector can't keep up with flow volume.
+        - alert: FlightRecorderFlowsDropped
+          expr: rate(flight_recorder_flows_dropped_total[5m]) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Flight recorder dropping flows on {{ "{{" }} $labels.instance {{ "}}" }}"
+            description: |
+              Flight recorder is dropping Hubble flow events faster than 1/s
+              because the detector's channel is full. Increase CPU/memory
+              allocations or reduce trigger complexity.
+
+        # Pod can't start captures at all. Usually points at Cilium
+        # recorder being misconfigured.
+        - alert: FlightRecorderCapturesAllFailing
+          expr: |
+            sum(rate(flight_recorder_captures_failed_total[15m])) by (instance)
+              > 0
+            and on(instance)
+            sum(rate(flight_recorder_captures_completed_total[15m])) by (instance)
+              == 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "All flight recorder captures failing on {{ "{{" }} $labels.instance {{ "}}" }}"
+            description: |
+              Every capture attempt has failed in the last 15 minutes and
+              none have completed. Check the Cilium BPF recorder is enabled
+              and reachable on this node.
+{{- end }}

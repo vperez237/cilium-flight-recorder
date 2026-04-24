@@ -183,7 +183,7 @@ make docker-logs
 # Quick smoke test — trigger one manual capture
 make docker-test
 
-# Full test suite — exercises all features (~75 seconds, 25 tests)
+# Full test suite — exercises all endpoints + error paths (~85 seconds, 51 assertions)
 make docker-test-all
 
 # Restart with a clean slate after code changes
@@ -280,10 +280,156 @@ make helm-install \
 
 ### Prerequisites
 
-- Cilium 1.19+ with Hubble Relay enabled
-- Cilium agent socket at `/var/run/cilium/cilium.sock`
-- S3 bucket for PCAP storage
-- IRSA ServiceAccount with `s3:PutObject` / `s3:GetObject` / `s3:ListBucket`
+The flight recorder depends on three pieces of platform plumbing; **all must be in
+place before the DaemonSet will work**.
+
+#### 1. Cilium with the BPF recorder enabled
+
+The Cilium agent exposes a REST API for the BPF PCAP recorder on its Unix
+socket. In most Cilium installs this is **off by default**; you have to opt in.
+
+```bash
+# Check whether the recorder API is reachable on a node:
+kubectl -n kube-system exec ds/cilium -- \
+  cilium-dbg recorder list 2>&1 | head
+
+# If you get "recorder: feature disabled" (or similar), enable it in the
+# Cilium Helm values and reinstall/upgrade Cilium:
+#
+#   # in your Cilium values.yaml
+#   bpf:
+#     enableRecorder: true
+#
+# Exact flag name changes between Cilium versions — consult the Cilium docs
+# for your release. The flight-recorder will open its circuit breaker
+# (flight_recorder_cilium_circuit_state == 1) if the API is missing.
+```
+
+#### 2. Hubble Relay reachable from the node
+
+The watcher connects to a cluster-wide Hubble Relay Service. Verify it's up:
+
+```bash
+kubectl -n kube-system get pod -l k8s-app=hubble-relay
+kubectl -n kube-system get svc hubble-relay
+```
+
+If Hubble Relay isn't installed, enable it in your Cilium Helm values
+(`hubble.relay.enabled: true`) and point `hubble.address` in
+`helm/values.yaml` at the resulting Service.
+
+#### 3. S3 bucket + IRSA role (EKS)
+
+Captured PCAPs are uploaded to S3 via the default AWS credential chain.
+On EKS the cleanest path is IRSA (IAM Roles for Service Accounts). Create
+the bucket, IAM policy, and role, then annotate the ServiceAccount.
+
+**IAM policy** (`flight-recorder-s3.json`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WritePCAPs",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": "arn:aws:s3:::flight-recorder-pcaps-prod/*"
+    },
+    {
+      "Sid": "ListForRetry",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::flight-recorder-pcaps-prod"
+    }
+  ]
+}
+```
+
+**Trust policy** (`flight-recorder-trust.json` — replace the OIDC bits with
+values from `aws eks describe-cluster --name <cluster> --query 'cluster.identity.oidc.issuer'`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::<account>:oidc-provider/oidc.eks.<region>.amazonaws.com/id/<OIDC_ID>"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "oidc.eks.<region>.amazonaws.com/id/<OIDC_ID>:sub":
+          "system:serviceaccount:kube-system:flight-recorder",
+        "oidc.eks.<region>.amazonaws.com/id/<OIDC_ID>:aud":
+          "sts.amazonaws.com"
+      }
+    }
+  }]
+}
+```
+
+**Create the role, attach the policy, set the annotation:**
+
+```bash
+# Bucket (with a 30-day lifecycle to keep storage cheap)
+aws s3api create-bucket --bucket flight-recorder-pcaps-prod --region us-east-1
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket flight-recorder-pcaps-prod \
+  --lifecycle-configuration '{"Rules":[{"ID":"expire-pcaps","Status":"Enabled","Filter":{},"Expiration":{"Days":30}}]}'
+
+# IAM
+aws iam create-policy \
+  --policy-name flight-recorder-s3 \
+  --policy-document file://flight-recorder-s3.json
+aws iam create-role \
+  --role-name flight-recorder \
+  --assume-role-policy-document file://flight-recorder-trust.json
+aws iam attach-role-policy \
+  --role-name flight-recorder \
+  --policy-arn arn:aws:iam::<account>:policy/flight-recorder-s3
+
+# In your values-<cluster>.yaml:
+#   serviceAccount:
+#     annotations:
+#       eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/flight-recorder
+```
+
+### Verification
+
+After `helm upgrade --install`, run these three checks in order. Each
+exercises one layer of the pipeline.
+
+```bash
+POD=$(kubectl -n kube-system get pod -l app.kubernetes.io/name=flight-recorder -o name | head -1)
+kubectl -n kube-system port-forward $POD 8080:8080 &
+
+# 1. Readiness (Hubble reachable?). Expect 200.
+curl -sf http://localhost:8080/ready | jq .
+# {"hubbleConnected": true, "status": "ready"}
+
+# 2. Cilium circuit breaker (BPF recorder API reachable?). Expect 0.
+curl -s http://localhost:8080/metrics | grep '^flight_recorder_cilium_circuit_state '
+# flight_recorder_cilium_circuit_state 0
+
+# 3. End-to-end (trigger → capture → S3). Expect an object in the bucket
+# within ~DurationSeconds+10s.
+curl -X POST http://localhost:8080/capture \
+  -H 'Content-Type: application/json' \
+  -d '{"srcCIDR":"10.0.0.0/8","dstCIDR":"10.0.0.0/8","dstPort":443,"durationSeconds":10}'
+# {"status":"accepted","message":"capture started"}
+
+sleep 15
+aws s3 ls s3://flight-recorder-pcaps-prod/$CLUSTER/ --recursive | tail
+```
+
+If any of those fail, see [Troubleshooting](#troubleshooting) below.
 
 ### Per-Cluster Values Files
 
@@ -326,16 +472,87 @@ triggers:
 
 In dev, `immediate` mode is better — it surfaces every error so you can confirm the pipeline works.
 
-### Rollout & Verification
+### Rollout
 
 ```bash
 kubectl -n kube-system rollout status ds/flight-recorder
 kubectl -n kube-system logs -l app.kubernetes.io/name=flight-recorder -f
+```
 
-# Port-forward to one pod and test the API
-POD=$(kubectl -n kube-system get pod -l app.kubernetes.io/name=flight-recorder -o name | head -1)
-kubectl -n kube-system port-forward $POD 8080:8080 &
-curl -s localhost:8080/captures | jq .
+For the post-install health check, see [Verification](#verification) above.
+
+### Troubleshooting
+
+| Symptom | Likely cause | What to check |
+|---|---|---|
+| `/ready` returns 503 with `hubbleConnected: false` | Hubble Relay unreachable | `hubble.address` in values, DNS from pod, `kubectl -n kube-system get svc hubble-relay` |
+| `flight_recorder_cilium_circuit_state == 1` | Cilium socket unreachable or BPF recorder disabled | `kubectl exec ds/cilium -- cilium-dbg recorder list`; enable `bpf.enableRecorder=true` in Cilium |
+| `flight_recorder_cilium_circuit_trips_total` climbs steadily | Cilium agent crash-looping or overloaded | `kubectl -n kube-system logs ds/cilium --previous` |
+| `flight_recorder_flows_processed_total == 0` | Hubble connected but no flows arriving | Hubble RBAC (the `hubble-relay-client-certs` secret); `cilium hubble observe` on a node |
+| PCAPs in `/tmp/flight-recorder/` but not in S3 | IRSA role missing / bucket policy denies PutObject | `kubectl describe sa flight-recorder` for the role annotation; check `flight_recorder_upload_attempts_total{outcome="terminal"}` |
+| `flight_recorder_flows_dropped_total` > 0 | Detector CPU-bound; flow channel full | Bump `resources.requests.cpu`, simplify triggers (drop `rate` mode if you don't need it) |
+| `ImagePullBackOff` on every pod | `image.repository` points at a registry you haven't pushed to | Either build and push `flight-recorder:{{ appVersion }}`, or point at the public image (see [Container Image](#container-image)) |
+| `flight_recorder_keys_evicted_total{reason="capacity"}` > 0 persistently | Busy cluster; `detector.maxTrackedKeys` too low for your tuple cardinality | Raise `detector.maxTrackedKeys` (memory scales linearly) |
+| Captures fire but PCAPs are always empty (24 bytes) | BPF recorder filter didn't match any packets | Broaden the filter; confirm Cilium datapath sees the flow (`hubble observe --from-ip … --to-ip …`) |
+| Pod memory creeping up | Per-tuple maps unbounded | Ensure `detector.idleEvictAfterSeconds` is set and the janitor is ticking (`rate(flight_recorder_keys_evicted_total[5m])` should be > 0 on a busy cluster) |
+
+### Sizing
+
+Memory and CPU scale with **flow volume** and **tuple cardinality** (unique
+`src IP → dst IP:port` pairs). Ballpark on an EKS node streaming 5k flows/s
+with ~500 active tuples:
+
+- **Memory**: ~80–120 MiB steady state (Go runtime ~40 MiB, per-tuple rate
+  windows ~10–20 MiB, capture buffers negligible). The 512 MiB default limit
+  in `values.yaml` gives ~4× headroom for burst tuple expansion.
+- **CPU**: 20–40 m with four triggers in `immediate` mode. `rate` mode is
+  cheaper (no per-flow work when under threshold).
+
+Scaling knobs when a node is underspec'd:
+
+| Problem | Knob |
+|---|---|
+| CPU-bound detector | Raise `resources.requests.cpu`; move hot triggers to `rate` mode |
+| Memory pressure | Lower `detector.maxTrackedKeys`; shorten `detector.idleEvictAfterSeconds`; shorten trigger `windowSeconds` |
+| Flow drops under spikes | Accept them — the channel buffer (256) is sized to absorb 2–3 seconds of backlog; rate > that means the detector can't keep up and more memory won't help |
+
+### Monitoring & Alerts
+
+The chart ships an opt-in `PrometheusRule` with alerts for the Cilium
+circuit opening, Hubble disconnection, sustained S3 failures, flow drops,
+and total capture failure. Enable with:
+
+```yaml
+prometheusRule:
+  enabled: true
+  labels:
+    release: kube-prometheus-stack   # if your Prometheus Operator's ruleSelector uses this
+```
+
+Requires the Prometheus Operator CRDs (`monitoring.coreos.com/v1`) in the
+target cluster.
+
+### NetworkPolicy
+
+`/metrics` and `/capture` both listen on port 8080, which means any pod in
+the cluster can trigger a capture by default. In a cluster with a NetworkPolicy
+controller, turn on the bundled policy to restrict ingress:
+
+```yaml
+networkPolicy:
+  enabled: true
+  scrapeFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  apiFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+  # Your cluster pod + service CIDRs (adjust for your CNI)
+  clusterCIDRs:
+    - 10.100.0.0/16
+    - 172.20.0.0/16
 ```
 
 ### Terraform (EKS)
@@ -348,9 +565,22 @@ repo. You'll need, at minimum:
 - An IAM role with `s3:PutObject` on that bucket, bound to the pod's
   ServiceAccount via IRSA (EKS OIDC trust).
 
-### Container Image Build
+### Container Image
 
-Build and push the production image to your own registry:
+Tagged releases publish a multi-arch image (linux/amd64 + linux/arm64) to
+GitHub Container Registry via the `.github/workflows/release.yml`
+workflow. To use the published image:
+
+```yaml
+image:
+  repository: ghcr.io/vperez237/flight-recorder
+  tag: v0.1.0
+```
+
+If you fork the repo, your own release tags will push to
+`ghcr.io/<your-gh-user>/flight-recorder`.
+
+To build and push manually (bypassing CI):
 
 ```bash
 docker build --target flight-recorder \
@@ -360,6 +590,45 @@ docker push <your-registry>/flight-recorder:v0.1.0
 
 Then point `image.repository` / `image.tag` at that image in your values file
 and re-run `make helm-upgrade`.
+
+### Helm Chart Distribution
+
+The release workflow also packages and pushes the chart to an OCI registry
+on tagged commits, so you can install without cloning:
+
+```bash
+helm install flight-recorder \
+  oci://ghcr.io/vperez237/charts/flight-recorder \
+  --version 0.1.0 \
+  -n kube-system --create-namespace \
+  -f my-values.yaml
+```
+
+To publish manually:
+
+```bash
+helm registry login ghcr.io -u <your-user>
+make helm-package
+make helm-publish CHART=flight-recorder-0.1.0.tgz
+```
+
+### Versioning
+
+The project follows semantic versioning (`MAJOR.MINOR.PATCH`). The Helm
+chart's `version` and `appVersion` track the same number for simplicity —
+both are rewritten by the release workflow from the Git tag.
+
+| Change | Version bump |
+|---|---|
+| API-breaking change to `/capture` request/response shape | MAJOR |
+| Rename or removal of a Helm value | MAJOR |
+| Rename of a Prometheus metric | MAJOR |
+| New trigger, new config field (with default), new metric | MINOR |
+| Bug fix that doesn't alter external behavior | PATCH |
+
+Internal Go package layout (`pkg/detector`, `pkg/capture`, etc.) is not
+treated as a stable API — the module isn't intended to be imported by
+external projects.
 
 ## API
 

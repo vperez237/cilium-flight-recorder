@@ -1,10 +1,13 @@
 .PHONY: build test clean \
 	docker-build docker-up docker-down docker-logs docker-test docker-test-all docker-restart \
-	helm-lint helm-template helm-install helm-upgrade helm-uninstall helm-diff
+	helm-lint helm-template helm-install helm-upgrade helm-uninstall helm-diff \
+	helm-package helm-publish
 
 HELM_RELEASE   ?= flight-recorder
 HELM_NAMESPACE ?= kube-system
-HELM_VALUES    ?= helm/values-eks-dev-01.yaml
+HELM_VALUES    ?= helm/values-example.yaml
+# Owner path under ghcr.io for chart / image publishing. Override per-fork.
+OCI_REGISTRY   ?= oci://ghcr.io/vperez237/charts
 
 # Build all binaries locally
 build:
@@ -97,6 +100,24 @@ helm-diff:
 # Uninstall the release
 helm-uninstall:
 	helm uninstall $(HELM_RELEASE) -n $(HELM_NAMESPACE)
+
+# Package the chart into a local .tgz artifact (released versions come from
+# tagged CI runs; this target is for local experimentation).
+helm-package:
+	helm package helm/
+
+# Push an already-packaged chart to an OCI registry. Requires prior:
+#   helm registry login ghcr.io -u <user>
+# Example:
+#   make helm-package && make helm-publish CHART=flight-recorder-0.1.0.tgz
+CHART ?=
+helm-publish:
+	@if [ -z "$(CHART)" ]; then \
+	  echo "CHART is required. Run 'make helm-package' first, then"; \
+	  echo "  make helm-publish CHART=flight-recorder-<version>.tgz"; \
+	  exit 1; \
+	fi
+	helm push $(CHART) $(OCI_REGISTRY)
 
 # Remove build artifacts
 clean:
