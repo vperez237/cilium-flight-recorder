@@ -28,3 +28,9 @@ capture:
 
 server:
   port: 8080
+
+# Send OTLP traces to the Jaeger all-in-one container. Sample everything
+# in local dev — it's low-volume and we want to see every capture.
+tracing:
+  endpoint: jaeger:4317
+  sampleRatio: 1.0

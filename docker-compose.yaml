@@ -53,6 +53,26 @@ services:
     ports:
       - "4245:4245"
 
+  # Jaeger all-in-one — receives OTLP spans from the flight-recorder and
+  # serves a UI so you can inspect the capture → upload span tree.
+  # UI:        http://localhost:16686
+  # OTLP gRPC: jaeger:4317 (from inside the compose network)
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI
+      - "4317:4317"     # OTLP gRPC (exposed on host too, for direct testing)
+    healthcheck:
+      # 14269 is Jaeger's admin port; `/` returns Prometheus metrics
+      # once the collector is ready to accept spans.
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:14269/ >/dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   # The Flight Recorder itself
   flight-recorder:
     build:
@@ -66,6 +86,8 @@ services:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
+      jaeger:
+        condition: service_healthy
     environment:
       NODE_NAME: docker-local
       AWS_ACCESS_KEY_ID: minioadmin

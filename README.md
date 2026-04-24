@@ -201,8 +201,27 @@ make docker-down
 | `mock-hubble` | Generates fake flows: drops, HTTP 5xx, DNS NXDOMAIN, latency spikes | `localhost:4245` (gRPC) |
 | `mock-cilium` | Simulates Cilium agent recorder API, writes dummy PCAPs | Unix socket |
 | `minio` | S3-compatible storage for captured PCAPs | Console: `http://localhost:9001` |
+| `jaeger` | Receives OTLP traces and shows the capture → upload span tree | UI: `http://localhost:16686` |
 
 MinIO credentials: `minioadmin` / `minioadmin`
+
+### Viewing Traces
+
+`testdata/config-local.yaml` ships with `tracing.endpoint: jaeger:4317`, so every
+capture automatically emits a span tree to Jaeger. Once `make docker-up` is
+running and the flight-recorder has fired at least one capture:
+
+1. Open `http://localhost:16686`
+2. Select service **flight-recorder**, then click **Find Traces**
+3. Open a trace to see the span tree:
+   - `capture.execute` (root span, tagged with `trigger`, `src_ip`, `dst_ip`, …)
+     - `cilium.createRecorder` — PUT to the BPF recorder API
+     - `cilium.stopAndCollect` — DELETE + file copy
+   - `s3.Upload` (separate trace per completed capture)
+     - `s3.Upload.attempt` (one child per retry attempt)
+
+Set `tracing.endpoint: ""` in your own config to disable tracing — the code
+installs a no-op tracer and spans cost effectively nothing.
 
 ### Test Suite
 
