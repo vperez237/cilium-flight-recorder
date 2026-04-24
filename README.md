@@ -347,8 +347,10 @@ and re-run `make helm-upgrade`.
 | Endpoint | Method | Description |
 |---|---|---|
 | `/capture` | POST | Trigger a manual PCAP capture |
-| `/captures` | GET | List recent captures (last 100) |
-| `/health` | GET | Liveness/readiness probe |
+| `/captures` | GET | List recent captures (paginated, newest first) |
+| `/health` | GET | Liveness probe — 200 while the process is alive |
+| `/ready` | GET | Readiness probe — 200 only while Hubble is connected, 503 otherwise |
+| `/metrics` | GET | Prometheus metrics |
 
 ### POST /capture
 
@@ -364,17 +366,43 @@ curl -X POST http://localhost:8080/capture \
   }'
 ```
 
-Response: `202 Accepted`
+Body fields:
 
-```json
-{"status": "accepted", "message": "capture started"}
-```
+| Field | Type | Notes |
+|---|---|---|
+| `srcCIDR` | string | Source IP or CIDR. Empty means "any". |
+| `dstCIDR` | string | Destination IP or CIDR. Empty means "any". |
+| `dstPort` | number | 0–65535. 0 means "any". |
+| `protocol` | string | `TCP`, `UDP`, `ICMPv4`, `ICMPv6`. Defaults to `TCP`. |
+| `durationSeconds` | number | 0 means "use the server default". |
+
+Responses:
+
+- `202 Accepted` — capture started, body is `{"status":"accepted","message":"capture started"}`
+- `400 Bad Request` — invalid JSON, bad IP/CIDR, out-of-range port, unsupported protocol, or negative duration. Body is `{"error":"…"}`.
 
 ### GET /captures
 
 ```bash
+# Default: up to 100 newest entries
 curl -s http://localhost:8080/captures | jq .
+
+# Pagination: 5 per page, skip the 10 most recent
+curl -s 'http://localhost:8080/captures?limit=5&offset=10' | jq .
+
+# Filter by trigger
+curl -s 'http://localhost:8080/captures?trigger=drop' | jq .
 ```
+
+Query parameters:
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `limit` | `100` | Max items to return. Capped at 1000. |
+| `offset` | `0` | Skip the N most recent entries. |
+| `trigger` | *(none)* | One of `drop`, `http_error`, `dns_failure`, `latency`, `manual`. |
+
+Response headers include `X-Total-Count`: the total after filtering, before pagination.
 
 Response:
 
@@ -396,10 +424,14 @@ Response:
 ### S3 Key Structure
 
 ```
-s3://{bucket}/{cluster}/{node}/{date}/{timestamp}_{trigger}_{src}_{dst}_{port}.pcap
+s3://{bucket}/{cluster}/{node}/{YYYY}/{MM}/{DD}/{timestamp}_{trigger}_{src}_{dst}_{port}.pcap
 ```
 
-Example: `flight-recorder-pcaps/example-cluster/ip-10-0-1-42/2026-03-26/20260326T140747Z_drop_10.0.1.139_10.0.2.203_8080.pcap`
+Example: `flight-recorder-pcaps/example-cluster/ip-10-0-1-42/2026/03/26/20260326T140747Z_drop_10.0.1.139_10.0.2.203_8080.pcap`
+
+The date is split into `YYYY/MM/DD` path segments so prefix-based S3 lifecycle
+rules and operator browsing (`aws s3 ls bucket/cluster/node/2026/`) work without
+parsing filenames.
 
 Each object includes S3 metadata: trigger, reason, source/dest IPs, port, protocol, duration, node, cluster, timestamp.
 
