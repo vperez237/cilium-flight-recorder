@@ -418,16 +418,22 @@ fi
 # --------------------------------------------------------------------------
 header "11. Capture Metadata Fields"
 # --------------------------------------------------------------------------
-SAMPLE=$(curl -s "$API/captures" | jq '.[0]')
-
-for field in trigger reason srcIP dstIP dstPort filePath startTime duration; do
-    VALUE=$(echo "$SAMPLE" | jq -r ".$field")
-    if [ "$VALUE" != "null" ] && [ -n "$VALUE" ]; then
-        pass "Capture has field '$field' = $VALUE"
-    else
-        fail "Capture missing field '$field'"
-    fi
-done
+# Pick the newest capture that has a non-empty srcIP. We deliberately fired
+# an "any" manual capture above (empty src/dst) so .[0] would legitimately
+# have empty srcIP/dstIP — filter those out before asserting on all fields.
+SAMPLE=$(curl -s "$API/captures" | jq '[.[] | select(.srcIP != "" and .dstIP != "")][0]')
+if [ "$SAMPLE" = "null" ] || [ -z "$SAMPLE" ]; then
+    fail "No capture found with non-empty srcIP/dstIP to assert metadata against"
+else
+    for field in trigger reason srcIP dstIP dstPort filePath startTime duration; do
+        VALUE=$(echo "$SAMPLE" | jq -r ".$field")
+        if [ "$VALUE" != "null" ] && [ -n "$VALUE" ]; then
+            pass "Capture has field '$field' = $VALUE"
+        else
+            fail "Capture missing field '$field'"
+        fi
+    done
+fi
 
 # --------------------------------------------------------------------------
 header "12. Metrics reflect captured activity"
