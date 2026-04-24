@@ -1,0 +1,20 @@
+# Compiled Go binaries — `go build ./...` in a cmd/ dir leaves one of these.
+/recorder
+/mock-cilium
+/mock-hubble
+
+# Jaeger UI trace exports.
+traces-*.json
+
+# Test and profiling output.
+coverage.out
+*.prof
+*.test
+
+# Local env / secrets.
+.env
+.env.local
+
+# OS junk.
+.DS_Store
+Thumbs.db
