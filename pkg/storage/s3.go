@@ -172,9 +172,12 @@ func (u *S3Uploader) upload(ctx context.Context, result capture.CaptureResult) (
 	}
 	fileSize := stat.Size()
 
-	date := result.StartTime.UTC().Format("2006-01-02")
+	// Split the date into YYYY/MM/DD path segments so prefix-based S3
+	// lifecycle rules (e.g. "delete cluster/*/2024/*") and operator browsing
+	// (`aws s3 ls bucket/cluster/node/2026/`) work without parsing filenames.
+	datePath := result.StartTime.UTC().Format("2006/01/02")
 	filename := filepath.Base(result.FilePath)
-	key := fmt.Sprintf("%s/%s/%s/%s", u.cluster, u.nodeName, date, filename)
+	key := fmt.Sprintf("%s/%s/%s/%s", u.cluster, u.nodeName, datePath, filename)
 
 	metadata := map[string]string{
 		"trigger":  string(result.Trigger),

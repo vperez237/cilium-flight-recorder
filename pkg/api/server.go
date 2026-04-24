@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +16,20 @@ import (
 	"github.com/vperez237/cilium-flight-recorder/pkg/detector"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// Pagination limits for /captures. A hard cap stops a single request from
+// returning the entire in-memory ring; the server keeps the last 100
+// completed captures, so defaultLimit=100 matches the old behaviour.
+const (
+	defaultListLimit = 100
+	maxListLimit     = 1000
+)
+
+// Protocols accepted by /capture. These match what the Cilium recorder
+// filter understands (see capture.protocolToNumber).
+var allowedProtocols = map[string]struct{}{
+	"TCP": {}, "UDP": {}, "ICMPv4": {}, "ICMPv6": {},
+}
 
 // HealthChecker reports the liveness state of upstream dependencies.
 // The API server uses it to answer /ready. Implementations must be safe
@@ -123,19 +140,48 @@ func (s *Server) RecordCapture(result capture.CaptureResult) {
 func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	var body CaptureRequestBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
+		return
+	}
+
+	srcIP, err := normalizeIP(body.SrcCIDR, "srcCIDR")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	dstIP, err := normalizeIP(body.DstCIDR, "dstCIDR")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if body.DstPort > 65535 {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("dstPort must be in [0,65535], got %d", body.DstPort))
 		return
 	}
 
 	if body.Protocol == "" {
 		body.Protocol = "TCP"
+	} else {
+		body.Protocol = strings.ToUpper(body.Protocol)
+	}
+	if _, ok := allowedProtocols[body.Protocol]; !ok {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("protocol must be one of TCP, UDP, ICMPv4, ICMPv6; got %q", body.Protocol))
+		return
+	}
+
+	if body.DurationSeconds < 0 {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("durationSeconds must be >= 0, got %d", body.DurationSeconds))
+		return
 	}
 
 	req := detector.CaptureRequest{
 		Trigger:   "manual",
 		Reason:    "manual trigger via API",
-		SrcIP:     stripCIDR(body.SrcCIDR),
-		DstIP:     stripCIDR(body.DstCIDR),
+		SrcIP:     srcIP,
+		DstIP:     dstIP,
 		DstPort:   body.DstPort,
 		Protocol:  body.Protocol,
 		Timestamp: time.Now(),
@@ -157,14 +203,55 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleListCaptures(w http.ResponseWriter, _ *http.Request) {
+// handleListCaptures returns recent captures, newest first. Supports:
+//   - limit:   max items to return (default 100, hard cap 1000)
+//   - offset:  skip the N most recent entries
+//   - trigger: filter by trigger type (drop, http_error, dns_failure, latency, manual)
+//
+// The total count (after filtering, before pagination) is returned in the
+// X-Total-Count header so clients can implement their own paging UI.
+func (s *Server) handleListCaptures(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	limit, err := parseIntParam(q.Get("limit"), defaultListLimit, 1, maxListLimit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "limit: "+err.Error())
+		return
+	}
+	offset, err := parseIntParam(q.Get("offset"), 0, 0, 1<<31-1)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "offset: "+err.Error())
+		return
+	}
+	triggerFilter := q.Get("trigger")
+
 	s.mu.RLock()
-	entries := make([]CaptureEntry, len(s.captures))
-	copy(entries, s.captures)
+	// Copy newest-first: the slice is appended in capture order, so iterate
+	// back-to-front and optionally filter by trigger.
+	filtered := make([]CaptureEntry, 0, len(s.captures))
+	for i := len(s.captures) - 1; i >= 0; i-- {
+		e := s.captures[i]
+		if triggerFilter != "" && e.Trigger != triggerFilter {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
 	s.mu.RUnlock()
 
+	total := len(filtered)
+	start := offset
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	page := filtered[start:end]
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(entries)
+	w.Header().Set("X-Total-Count", strconv.Itoa(total))
+	json.NewEncoder(w).Encode(page)
 }
 
 // handleHealth is a liveness probe: the process is alive and the HTTP server
@@ -194,12 +281,48 @@ func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(body)
 }
 
-// stripCIDR removes the /prefix from a CIDR string to get just the IP.
-func stripCIDR(cidr string) string {
-	for i := 0; i < len(cidr); i++ {
-		if cidr[i] == '/' {
-			return cidr[:i]
-		}
+// normalizeIP accepts either a bare IP ("10.0.1.5") or a CIDR ("10.0.1.5/32")
+// and returns the IP string. An empty input is allowed (means "any"). The
+// field name is included in error messages so callers see which input is bad.
+func normalizeIP(input, field string) (string, error) {
+	if input == "" {
+		return "", nil
 	}
-	return cidr
+	if strings.Contains(input, "/") {
+		ip, _, err := net.ParseCIDR(input)
+		if err != nil {
+			return "", fmt.Errorf("%s: invalid CIDR %q: %w", field, input, err)
+		}
+		return ip.String(), nil
+	}
+	ip := net.ParseIP(input)
+	if ip == nil {
+		return "", fmt.Errorf("%s: invalid IP %q", field, input)
+	}
+	return ip.String(), nil
+}
+
+// parseIntParam parses a query-string integer with a default, a min, and a
+// max. Empty string returns the default without error.
+func parseIntParam(raw string, def, min, max int) (int, error) {
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("not an integer: %q", raw)
+	}
+	if v < min || v > max {
+		return 0, fmt.Errorf("must be in [%d,%d], got %d", min, max, v)
+	}
+	return v, nil
+}
+
+// writeError writes a JSON error body with the given HTTP status. Matches
+// the JSON content-type of the success path so clients can always parse
+// the body.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
