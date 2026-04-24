@@ -115,7 +115,7 @@ All configuration is driven by the Helm chart values. `helm/values.yaml` documen
 |---|---|---|
 | `cluster.name` | `example-cluster` | Cluster identifier (embedded in S3 keys + metadata) |
 | `image.repository` | `ghcr.io/vperez237/flight-recorder` | Container image (override for your registry) |
-| `image.tag` | Chart `appVersion` | Image tag (override per deployment) |
+| `image.tag` | `v<appVersion>` (e.g. `v0.1.0`) | Image tag. Empty uses the v-prefixed form of the chart's appVersion. |
 | `s3.bucket` | `flight-recorder-pcaps` | Target S3 bucket |
 | `s3.region` | `us-east-1` | AWS region |
 | `s3.endpoint` | `""` | Custom S3 endpoint (MinIO/LocalStack) |
