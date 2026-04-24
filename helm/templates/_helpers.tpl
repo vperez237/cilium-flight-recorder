@@ -60,9 +60,16 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
-Image reference (handles empty tag defaulting to chart appVersion)
+Image reference. When image.tag is empty, defaults to "v<AppVersion>" —
+the release workflow publishes that tag alongside the bare semver form
+and "latest", and the v-prefixed form matches the cloud-native convention
+most users will expect (Cilium, Prometheus, etc. all tag this way).
+An explicit image.tag value is used verbatim, no prefix inserted.
 */}}
 {{- define "flight-recorder.image" -}}
-{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- $tag := .Values.image.tag -}}
+{{- if not $tag -}}
+  {{- $tag = printf "v%s" .Chart.AppVersion -}}
+{{- end -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end }}

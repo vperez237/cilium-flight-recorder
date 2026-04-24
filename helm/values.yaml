@@ -9,7 +9,10 @@ image:
   # -- Container image reference. Override this with the registry/repo where
   # -- you publish your own build (ECR, GHCR, Docker Hub, etc.).
   repository: ghcr.io/vperez237/flight-recorder
-  tag: ""  # defaults to .Chart.AppVersion
+  # -- Image tag. When empty, defaults to "v<chart appVersion>" (e.g.
+  # -- v0.1.0). Set explicitly to pin to a different tag (bare semver,
+  # -- "latest", or a pre-release like v0.2.0-rc1).
+  tag: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
