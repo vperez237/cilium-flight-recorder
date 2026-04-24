@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	flowpb "github.com/cilium/cilium/api/v1/flow"
 	"github.com/vperez237/cilium-flight-recorder/pkg/config"
 	"github.com/vperez237/cilium-flight-recorder/pkg/metrics"
 	"github.com/vperez237/cilium-flight-recorder/pkg/watcher"
@@ -35,6 +34,8 @@ type CaptureRequest struct {
 }
 
 // AnomalyDetector evaluates Hubble flow events against configurable rules.
+// The per-trigger logic lives in trigger_*.go files; this file contains the
+// orchestration: lifecycle, dispatch, cooldown, emit, and the janitor.
 type AnomalyDetector struct {
 	cfg             config.TriggersConfig
 	cooldown        time.Duration
@@ -99,8 +100,75 @@ func (d *AnomalyDetector) Run(ctx context.Context, flows <-chan watcher.FlowEven
 	}
 }
 
+// evaluate dispatches a flow to every enabled trigger. To add a new trigger:
+// implement a check*() method in a trigger_*.go file, add a TriggerType
+// constant, add its config to config.TriggersConfig, and add a line here.
+func (d *AnomalyDetector) evaluate(event watcher.FlowEvent) {
+	flow := event.Flow
+	if flow == nil {
+		return
+	}
+	metrics.FlowsProcessed.Inc()
+
+	if d.cfg.Drops.Enabled {
+		d.checkDrop(flow, event.Timestamp)
+	}
+	if d.cfg.HTTPErrors.Enabled {
+		d.checkHTTPError(flow, event.Timestamp)
+	}
+	if d.cfg.DNSFailures.Enabled {
+		d.checkDNSFailure(flow, event.Timestamp)
+	}
+	if d.cfg.Latency.Enabled {
+		d.checkLatency(flow, event.Timestamp)
+	}
+}
+
+func (d *AnomalyDetector) getOrCreateRateWindow(m map[string]*rateWindow, key string, dur time.Duration) *rateWindow {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rw, ok := m[key]
+	if !ok {
+		rw = newRateWindow(dur)
+		m[key] = rw
+	}
+	return rw
+}
+
+// emit publishes a capture request unless the same (trigger, src, dst, port,
+// proto) tuple has fired within the cooldown. Drops if the capture channel
+// is full (tracked by metrics.CaptureRequestsDropped).
+func (d *AnomalyDetector) emit(req CaptureRequest) {
+	key := fmt.Sprintf("%s:%s:%s:%d:%s", req.Trigger, req.SrcIP, req.DstIP, req.DstPort, req.Protocol)
+
+	d.mu.Lock()
+	last, exists := d.lastCapture[key]
+	if exists && time.Since(last) < d.cooldown {
+		d.mu.Unlock()
+		return
+	}
+	d.lastCapture[key] = time.Now()
+	d.mu.Unlock()
+
+	d.logger.Info("anomaly detected",
+		"trigger", req.Trigger,
+		"reason", req.Reason,
+		"src", req.SrcIP,
+		"dst", req.DstIP,
+	)
+
+	metrics.RecordTriggerFired(string(req.Trigger))
+
+	select {
+	case d.captureCh <- req:
+	default:
+		metrics.CaptureRequestsDropped.WithLabelValues(string(req.Trigger)).Inc()
+		d.logger.Warn("capture channel full, dropping request")
+	}
+}
+
 // sweepIdle evicts per-tuple bookkeeping entries that have been idle longer
-// than idleTTL and enforces the maxKeys cap on each map. It exports the
+// than idleTTL and enforces the maxKeys cap on each map. Exports the
 // resulting sizes to Prometheus.
 func (d *AnomalyDetector) sweepIdle() {
 	now := time.Now()
@@ -187,398 +255,4 @@ func (d *AnomalyDetector) capLatencies() {
 		delete(d.latencies, entries[i].k)
 		metrics.KeysEvicted.WithLabelValues("latencies", "capacity").Inc()
 	}
-}
-
-func (d *AnomalyDetector) evaluate(event watcher.FlowEvent) {
-	flow := event.Flow
-	if flow == nil {
-		return
-	}
-	metrics.FlowsProcessed.Inc()
-
-	if d.cfg.Drops.Enabled {
-		d.checkDrop(flow, event.Timestamp)
-	}
-	if d.cfg.HTTPErrors.Enabled {
-		d.checkHTTPError(flow, event.Timestamp)
-	}
-	if d.cfg.DNSFailures.Enabled {
-		d.checkDNSFailure(flow, event.Timestamp)
-	}
-	if d.cfg.Latency.Enabled {
-		d.checkLatency(flow, event.Timestamp)
-	}
-}
-
-func (d *AnomalyDetector) checkDrop(flow *flowpb.Flow, ts time.Time) {
-	if flow.GetVerdict() != flowpb.Verdict_DROPPED {
-		return
-	}
-
-	dstIP := destinationIP(flow)
-	dstPort := extractDstPort(flow)
-	proto := extractProtocol(flow)
-
-	metrics.AnomaliesDetected.WithLabelValues(string(TriggerDrop)).Inc()
-
-	if d.cfg.Drops.Mode == config.ModeRate {
-		key := fmt.Sprintf("drop:%s:%d", dstIP, dstPort)
-		rw := d.getOrCreateRateWindow(d.dropRates, key, time.Duration(d.cfg.Drops.WindowSeconds)*time.Second)
-		rw.Add(true)
-		count := rw.ErrorCount()
-		if count < d.cfg.Drops.MinDrops {
-			return
-		}
-		req := CaptureRequest{
-			Trigger:   TriggerDrop,
-			Reason:    fmt.Sprintf("%d drops to %s:%d in last %ds", count, dstIP, dstPort, d.cfg.Drops.WindowSeconds),
-			DstIP:     dstIP,
-			DstPort:   dstPort,
-			Protocol:  proto,
-			Timestamp: ts,
-		}
-		d.emit(req)
-		return
-	}
-
-	req := CaptureRequest{
-		Trigger:   TriggerDrop,
-		Reason:    fmt.Sprintf("packet dropped: %s", flow.GetDropReasonDesc().String()),
-		SrcIP:     sourceIP(flow),
-		DstIP:     dstIP,
-		DstPort:   dstPort,
-		Protocol:  proto,
-		Timestamp: ts,
-	}
-	d.emit(req)
-}
-
-func (d *AnomalyDetector) checkHTTPError(flow *flowpb.Flow, ts time.Time) {
-	l7 := flow.GetL7()
-	if l7 == nil {
-		return
-	}
-	http := l7.GetHttp()
-	if http == nil {
-		return
-	}
-
-	code := int(http.GetCode())
-	if code == 0 {
-		return
-	}
-	isError := d.isHTTPErrorCode(code)
-
-	dstIP := destinationIP(flow)
-	dstPort := extractDstPort(flow)
-
-	if d.cfg.HTTPErrors.Mode == config.ModeRate {
-		key := fmt.Sprintf("http:%s:%d", dstIP, dstPort)
-		rw := d.getOrCreateRateWindow(d.httpRates, key, time.Duration(d.cfg.HTTPErrors.WindowSeconds)*time.Second)
-		rw.Add(isError)
-		total, errors, rate := rw.Stats()
-		metrics.RateWindowErrors.WithLabelValues(string(TriggerHTTPError)).Set(rate)
-		if total < d.cfg.HTTPErrors.MinEvents {
-			return
-		}
-		if rate < d.cfg.HTTPErrors.RateThreshold {
-			return
-		}
-		metrics.AnomaliesDetected.WithLabelValues(string(TriggerHTTPError)).Inc()
-		req := CaptureRequest{
-			Trigger: TriggerHTTPError,
-			Reason: fmt.Sprintf("HTTP error rate %.1f%% (%d/%d) to %s:%d exceeds %.1f%% over %ds",
-				rate*100, errors, total, dstIP, dstPort,
-				d.cfg.HTTPErrors.RateThreshold*100, d.cfg.HTTPErrors.WindowSeconds),
-			DstIP:     dstIP,
-			DstPort:   dstPort,
-			Protocol:  "TCP",
-			Timestamp: ts,
-		}
-		d.emit(req)
-		return
-	}
-
-	if !isError {
-		return
-	}
-
-	metrics.AnomaliesDetected.WithLabelValues(string(TriggerHTTPError)).Inc()
-	req := CaptureRequest{
-		Trigger:   TriggerHTTPError,
-		Reason:    fmt.Sprintf("HTTP %d on %s %s", code, http.GetMethod(), http.GetUrl()),
-		SrcIP:     sourceIP(flow),
-		DstIP:     dstIP,
-		DstPort:   dstPort,
-		Protocol:  "TCP",
-		Timestamp: ts,
-	}
-	d.emit(req)
-}
-
-func (d *AnomalyDetector) checkDNSFailure(flow *flowpb.Flow, ts time.Time) {
-	l7 := flow.GetL7()
-	if l7 == nil {
-		return
-	}
-	dns := l7.GetDns()
-	if dns == nil {
-		return
-	}
-
-	rcode := rcodeToString(int(dns.GetRcode()))
-	isFailure := d.isDNSFailureRCode(rcode)
-
-	srcIPStr := sourceIP(flow)
-
-	if d.cfg.DNSFailures.Mode == config.ModeRate {
-		key := fmt.Sprintf("dns:%s", srcIPStr)
-		rw := d.getOrCreateRateWindow(d.dnsRates, key, time.Duration(d.cfg.DNSFailures.WindowSeconds)*time.Second)
-		rw.Add(isFailure)
-		total, errors, rate := rw.Stats()
-		metrics.RateWindowErrors.WithLabelValues(string(TriggerDNSFailure)).Set(rate)
-		if total < d.cfg.DNSFailures.MinEvents {
-			return
-		}
-		if rate < d.cfg.DNSFailures.RateThreshold {
-			return
-		}
-		metrics.AnomaliesDetected.WithLabelValues(string(TriggerDNSFailure)).Inc()
-		req := CaptureRequest{
-			Trigger: TriggerDNSFailure,
-			Reason: fmt.Sprintf("DNS failure rate %.1f%% (%d/%d) from %s exceeds %.1f%% over %ds",
-				rate*100, errors, total, srcIPStr,
-				d.cfg.DNSFailures.RateThreshold*100, d.cfg.DNSFailures.WindowSeconds),
-			SrcIP:     srcIPStr,
-			DstPort:   53,
-			Protocol:  "UDP",
-			Timestamp: ts,
-		}
-		d.emit(req)
-		return
-	}
-
-	if !isFailure {
-		return
-	}
-
-	metrics.AnomaliesDetected.WithLabelValues(string(TriggerDNSFailure)).Inc()
-	req := CaptureRequest{
-		Trigger:   TriggerDNSFailure,
-		Reason:    fmt.Sprintf("DNS %s for query %s", rcode, dns.GetQuery()),
-		SrcIP:     srcIPStr,
-		DstIP:     destinationIP(flow),
-		DstPort:   53,
-		Protocol:  "UDP",
-		Timestamp: ts,
-	}
-	d.emit(req)
-}
-
-func (d *AnomalyDetector) checkLatency(flow *flowpb.Flow, ts time.Time) {
-	l7 := flow.GetL7()
-	if l7 == nil || l7.GetLatencyNs() == 0 {
-		return
-	}
-
-	latencyMs := float64(l7.GetLatencyNs()) / 1e6
-	key := fmt.Sprintf("%s->%s", sourceIP(flow), destinationIP(flow))
-
-	d.mu.Lock()
-	sw, ok := d.latencies[key]
-	if !ok {
-		sw = newSlidingWindow(d.cfg.Latency.WindowSize)
-		d.latencies[key] = sw
-	}
-	sw.Add(latencyMs)
-	p99 := sw.Percentile(99)
-	d.mu.Unlock()
-
-	if p99 < float64(d.cfg.Latency.ThresholdMs) {
-		return
-	}
-
-	metrics.AnomaliesDetected.WithLabelValues(string(TriggerLatency)).Inc()
-	req := CaptureRequest{
-		Trigger:   TriggerLatency,
-		Reason:    fmt.Sprintf("P99 latency %.0fms exceeds %dms threshold", p99, d.cfg.Latency.ThresholdMs),
-		SrcIP:     sourceIP(flow),
-		DstIP:     destinationIP(flow),
-		DstPort:   extractDstPort(flow),
-		Protocol:  extractProtocol(flow),
-		Timestamp: ts,
-	}
-	d.emit(req)
-}
-
-func (d *AnomalyDetector) getOrCreateRateWindow(m map[string]*rateWindow, key string, dur time.Duration) *rateWindow {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	rw, ok := m[key]
-	if !ok {
-		rw = newRateWindow(dur)
-		m[key] = rw
-	}
-	return rw
-}
-
-func (d *AnomalyDetector) emit(req CaptureRequest) {
-	key := fmt.Sprintf("%s:%s:%s:%d:%s", req.Trigger, req.SrcIP, req.DstIP, req.DstPort, req.Protocol)
-
-	d.mu.Lock()
-	last, exists := d.lastCapture[key]
-	if exists && time.Since(last) < d.cooldown {
-		d.mu.Unlock()
-		return
-	}
-	d.lastCapture[key] = time.Now()
-	d.mu.Unlock()
-
-	d.logger.Info("anomaly detected",
-		"trigger", req.Trigger,
-		"reason", req.Reason,
-		"src", req.SrcIP,
-		"dst", req.DstIP,
-	)
-
-	metrics.RecordTriggerFired(string(req.Trigger))
-
-	select {
-	case d.captureCh <- req:
-	default:
-		metrics.CaptureRequestsDropped.WithLabelValues(string(req.Trigger)).Inc()
-		d.logger.Warn("capture channel full, dropping request")
-	}
-}
-
-func (d *AnomalyDetector) isHTTPErrorCode(code int) bool {
-	for _, c := range d.cfg.HTTPErrors.StatusCodes {
-		if c == code {
-			return true
-		}
-	}
-	return false
-}
-
-func (d *AnomalyDetector) isDNSFailureRCode(rcode string) bool {
-	for _, r := range d.cfg.DNSFailures.RCodes {
-		if r == rcode {
-			return true
-		}
-	}
-	return false
-}
-
-func extractIP(ep *flowpb.Endpoint) string {
-	if ep == nil {
-		return ""
-	}
-	return fmt.Sprintf("%d", ep.GetID())
-}
-
-func sourceIP(flow *flowpb.Flow) string {
-	if ip := flow.GetIP(); ip != nil {
-		return ip.GetSource()
-	}
-	return extractIP(flow.GetSource())
-}
-
-func destinationIP(flow *flowpb.Flow) string {
-	if ip := flow.GetIP(); ip != nil {
-		return ip.GetDestination()
-	}
-	return extractIP(flow.GetDestination())
-}
-
-func extractDstPort(flow *flowpb.Flow) uint32 {
-	l4 := flow.GetL4()
-	if l4 == nil {
-		return 0
-	}
-	if tcp := l4.GetTCP(); tcp != nil {
-		return tcp.GetDestinationPort()
-	}
-	if udp := l4.GetUDP(); udp != nil {
-		return udp.GetDestinationPort()
-	}
-	return 0
-}
-
-func extractProtocol(flow *flowpb.Flow) string {
-	l4 := flow.GetL4()
-	if l4 == nil {
-		return "TCP"
-	}
-	if l4.GetTCP() != nil {
-		return "TCP"
-	}
-	if l4.GetUDP() != nil {
-		return "UDP"
-	}
-	if l4.GetICMPv4() != nil {
-		return "ICMPv4"
-	}
-	if l4.GetICMPv6() != nil {
-		return "ICMPv6"
-	}
-	return "TCP"
-}
-
-var rcodeNames = map[int]string{
-	0: "NOERROR",
-	1: "FORMERR",
-	2: "SERVFAIL",
-	3: "NXDOMAIN",
-	4: "NOTIMP",
-	5: "REFUSED",
-}
-
-func rcodeToString(rcode int) string {
-	if name, ok := rcodeNames[rcode]; ok {
-		return name
-	}
-	return fmt.Sprintf("RCODE_%d", rcode)
-}
-
-// slidingWindow tracks the last N values for percentile computation.
-type slidingWindow struct {
-	values   []float64
-	size     int
-	pos      int
-	full     bool
-	lastSeen time.Time
-}
-
-func newSlidingWindow(size int) *slidingWindow {
-	return &slidingWindow{
-		values: make([]float64, size),
-		size:   size,
-	}
-}
-
-func (w *slidingWindow) Add(v float64) {
-	w.values[w.pos] = v
-	w.pos++
-	if w.pos >= w.size {
-		w.pos = 0
-		w.full = true
-	}
-	w.lastSeen = time.Now()
-}
-
-func (w *slidingWindow) Percentile(p float64) float64 {
-	n := w.size
-	if !w.full {
-		n = w.pos
-	}
-	if n == 0 {
-		return 0
-	}
-
-	sorted := make([]float64, n)
-	copy(sorted, w.values[:n])
-	sort.Float64s(sorted)
-
-	idx := int(float64(n-1) * p / 100)
-	return sorted[idx]
 }

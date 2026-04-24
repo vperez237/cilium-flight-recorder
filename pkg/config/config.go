@@ -24,6 +24,8 @@ type Config struct {
 	Server           ServerConfig   `yaml:"server"`
 	Detector         DetectorConfig `yaml:"detector"`
 	Upload           UploadConfig   `yaml:"upload"`
+	Cilium           CiliumConfig   `yaml:"cilium"`
+	Tracing          TracingConfig  `yaml:"tracing"`
 }
 
 // DetectorConfig tunes the per-tuple bookkeeping inside AnomalyDetector.
@@ -42,6 +44,23 @@ type UploadConfig struct {
 	MaxAttempts      int `yaml:"maxAttempts"`
 	InitialBackoffMs int `yaml:"initialBackoffMs"`
 	MaxBackoffMs     int `yaml:"maxBackoffMs"`
+}
+
+// CiliumConfig gates calls to the Cilium agent Unix socket. The circuit
+// breaker opens after FailureThreshold consecutive failures and stays open
+// for CooldownSeconds before admitting a probe, preventing a dead agent
+// from stalling every capture for 10s of HTTP timeout.
+type CiliumConfig struct {
+	CircuitFailureThreshold int `yaml:"circuitFailureThreshold"`
+	CircuitCooldownSeconds  int `yaml:"circuitCooldownSeconds"`
+}
+
+// TracingConfig wires OpenTelemetry. An empty Endpoint disables tracing
+// entirely (a no-op tracer is installed, spans cost ~nothing). SampleRatio
+// is only consulted when tracing is enabled.
+type TracingConfig struct {
+	Endpoint    string  `yaml:"endpoint"`
+	SampleRatio float64 `yaml:"sampleRatio"`
 }
 
 type TriggersConfig struct {
@@ -229,6 +248,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("upload.maxBackoffMs (%d) must be >= initialBackoffMs (%d)", c.Upload.MaxBackoffMs, c.Upload.InitialBackoffMs)
 	}
 
+	if c.Cilium.CircuitFailureThreshold <= 0 {
+		return fmt.Errorf("cilium.circuitFailureThreshold must be > 0, got %d", c.Cilium.CircuitFailureThreshold)
+	}
+	if c.Cilium.CircuitCooldownSeconds <= 0 {
+		return fmt.Errorf("cilium.circuitCooldownSeconds must be > 0, got %d", c.Cilium.CircuitCooldownSeconds)
+	}
+
+	if c.Tracing.SampleRatio < 0 || c.Tracing.SampleRatio > 1 {
+		return fmt.Errorf("tracing.sampleRatio must be in [0,1], got %v", c.Tracing.SampleRatio)
+	}
+
 	return nil
 }
 
@@ -341,5 +371,19 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Upload.MaxBackoffMs == 0 {
 		cfg.Upload.MaxBackoffMs = 30000
+	}
+
+	// Cilium agent circuit breaker
+	if cfg.Cilium.CircuitFailureThreshold == 0 {
+		cfg.Cilium.CircuitFailureThreshold = 3
+	}
+	if cfg.Cilium.CircuitCooldownSeconds == 0 {
+		cfg.Cilium.CircuitCooldownSeconds = 10
+	}
+
+	// Tracing: default sample ratio of 1.0 only matters if tracing is
+	// enabled (i.e. Endpoint is non-empty); otherwise it's unused.
+	if cfg.Tracing.SampleRatio == 0 {
+		cfg.Tracing.SampleRatio = 1.0
 	}
 }

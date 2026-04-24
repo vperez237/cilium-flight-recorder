@@ -57,5 +57,13 @@ data:
       initialBackoffMs: {{ .Values.upload.initialBackoffMs }}
       maxBackoffMs: {{ .Values.upload.maxBackoffMs }}
 
+    cilium:
+      circuitFailureThreshold: {{ .Values.cilium.circuitFailureThreshold }}
+      circuitCooldownSeconds: {{ .Values.cilium.circuitCooldownSeconds }}
+
+    tracing:
+      endpoint: {{ .Values.tracing.endpoint | quote }}
+      sampleRatio: {{ .Values.tracing.sampleRatio }}
+
     server:
       port: {{ .Values.server.port }}

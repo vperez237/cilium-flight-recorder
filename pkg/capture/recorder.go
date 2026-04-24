@@ -18,6 +18,10 @@ import (
 	"github.com/vperez237/cilium-flight-recorder/pkg/config"
 	"github.com/vperez237/cilium-flight-recorder/pkg/detector"
 	"github.com/vperez237/cilium-flight-recorder/pkg/metrics"
+	"github.com/vperez237/cilium-flight-recorder/pkg/tracing"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // CaptureResult describes a completed PCAP capture.
@@ -41,13 +45,14 @@ type CaptureManager struct {
 	resultCh   chan CaptureResult
 	logger     *slog.Logger
 	client     *http.Client
+	breaker    *circuitBreaker
 
 	activeCount atomic.Int32
 	nextID      atomic.Int64
 	mu          sync.Mutex
 }
 
-func NewCaptureManager(socketPath, outputDir string, cfg config.CaptureConfig, logger *slog.Logger) (*CaptureManager, error) {
+func NewCaptureManager(socketPath, outputDir string, cfg config.CaptureConfig, ciliumCfg config.CiliumConfig, logger *slog.Logger) (*CaptureManager, error) {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating output directory: %w", err)
 	}
@@ -68,6 +73,10 @@ func NewCaptureManager(socketPath, outputDir string, cfg config.CaptureConfig, l
 			Transport: transport,
 			Timeout:   10 * time.Second,
 		},
+		breaker: newCircuitBreaker(
+			ciliumCfg.CircuitFailureThreshold,
+			time.Duration(ciliumCfg.CircuitCooldownSeconds)*time.Second,
+		),
 	}, nil
 }
 
@@ -137,6 +146,22 @@ func (m *CaptureManager) executeCaptureWithDuration(ctx context.Context, req det
 	startTime := time.Now()
 	trigger := string(req.Trigger)
 
+	// Root span for this capture. Child spans for createRecorder /
+	// stopAndCollect are started inside those methods.
+	ctx, span := tracing.Tracer().Start(ctx, "capture.execute",
+		trace.WithAttributes(
+			attribute.String("trigger", trigger),
+			attribute.String("reason", req.Reason),
+			attribute.String("src_ip", req.SrcIP),
+			attribute.String("dst_ip", req.DstIP),
+			attribute.Int("dst_port", int(req.DstPort)),
+			attribute.String("protocol", req.Protocol),
+			attribute.Int64("recorder_id", recorderID),
+			attribute.Float64("duration_seconds", duration.Seconds()),
+		),
+	)
+	defer span.End()
+
 	m.logger.Info("starting capture",
 		"recorder_id", recorderID,
 		"trigger", req.Trigger,
@@ -149,6 +174,8 @@ func (m *CaptureManager) executeCaptureWithDuration(ctx context.Context, req det
 	if err := m.createRecorder(ctx, recorderID, req); err != nil {
 		metrics.RecordCaptureFailed(trigger, "create_recorder")
 		m.logger.Error("failed to create recorder", "error", err, "recorder_id", recorderID)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "create recorder failed")
 		return
 	}
 
@@ -161,6 +188,8 @@ func (m *CaptureManager) executeCaptureWithDuration(ctx context.Context, req det
 	if err != nil {
 		metrics.RecordCaptureFailed(trigger, "stop_and_collect")
 		m.logger.Error("failed to stop recorder", "error", err, "recorder_id", recorderID)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "stop and collect failed")
 		return
 	}
 
@@ -199,6 +228,11 @@ type recorderFilter struct {
 }
 
 func (m *CaptureManager) createRecorder(ctx context.Context, id int64, req detector.CaptureRequest) error {
+	ctx, span := tracing.Tracer().Start(ctx, "cilium.createRecorder",
+		trace.WithAttributes(attribute.Int64("recorder_id", id)),
+	)
+	defer span.End()
+
 	filter := recorderFilter{
 		Protocol: protocolToNumber(req.Protocol),
 	}
@@ -229,32 +263,59 @@ func (m *CaptureManager) createRecorder(ctx context.Context, id int64, req detec
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
+	if err := m.breaker.allow(); err != nil {
+		return err
+	}
 	resp, err := m.client.Do(httpReq)
 	if err != nil {
+		m.breaker.report(err)
 		return fmt.Errorf("creating recorder: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("cilium API returned %d: %s", resp.StatusCode, string(respBody))
+		// 4xx (client-side misuse) shouldn't trip the breaker; only 5xx
+		// suggests the agent itself is unhealthy.
+		apiErr := fmt.Errorf("cilium API returned %d: %s", resp.StatusCode, string(respBody))
+		if resp.StatusCode >= 500 {
+			m.breaker.report(apiErr)
+		} else {
+			m.breaker.report(nil)
+		}
+		return apiErr
 	}
 
+	m.breaker.report(nil)
 	return nil
 }
 
-func (m *CaptureManager) stopAndCollect(_ context.Context, id int64, req detector.CaptureRequest, startTime time.Time) (string, error) {
+func (m *CaptureManager) stopAndCollect(ctx context.Context, id int64, req detector.CaptureRequest, startTime time.Time) (string, error) {
+	_, span := tracing.Tracer().Start(ctx, "cilium.stopAndCollect",
+		trace.WithAttributes(attribute.Int64("recorder_id", id)),
+	)
+	defer span.End()
+
 	url := fmt.Sprintf("http://localhost/v1/recorder/%d", id)
 	httpReq, err := http.NewRequest(http.MethodDelete, url, nil)
 	if err != nil {
 		return "", err
 	}
 
+	if err := m.breaker.allow(); err != nil {
+		return "", err
+	}
 	resp, err := m.client.Do(httpReq)
 	if err != nil {
+		m.breaker.report(err)
 		return "", fmt.Errorf("stopping recorder: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		m.breaker.report(fmt.Errorf("cilium API returned %d", resp.StatusCode))
+	} else {
+		m.breaker.report(nil)
+	}
 
 	srcPath := filepath.Join(m.cfg.PcapSourceDir, fmt.Sprintf("%d.pcap", id))
 	dstFilename := fmt.Sprintf("%s_%s_%s_%s_%d.pcap",

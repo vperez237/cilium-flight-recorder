@@ -190,6 +190,32 @@ var (
 		},
 		[]string{"outcome"}, // "success", "retryable", "terminal"
 	)
+
+	// CiliumCircuitState is the current circuit-breaker state protecting the
+	// Cilium agent socket (0=closed, 1=open, 2=half-open).
+	CiliumCircuitState = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "flight_recorder_cilium_circuit_state",
+			Help: "Cilium agent circuit breaker state (0=closed, 1=open, 2=half-open)",
+		},
+	)
+
+	// CiliumCircuitTrips counts the number of times the breaker has opened.
+	CiliumCircuitTrips = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "flight_recorder_cilium_circuit_trips_total",
+			Help: "Number of times the Cilium circuit breaker has opened",
+		},
+	)
+
+	// CiliumShortCircuited counts requests that were failed fast because
+	// the breaker was open (i.e. never actually hit the Cilium socket).
+	CiliumShortCircuited = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "flight_recorder_cilium_short_circuited_total",
+			Help: "Cilium API requests rejected by the open circuit breaker",
+		},
+	)
 )
 
 // RecordTriggerFired increments the trigger fired counter.
