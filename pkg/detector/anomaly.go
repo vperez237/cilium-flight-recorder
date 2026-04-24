@@ -56,7 +56,7 @@ type AnomalyDetector struct {
 }
 
 func NewAnomalyDetector(triggersCfg config.TriggersConfig, cooldownSeconds int, detectorCfg config.DetectorConfig, logger *slog.Logger) *AnomalyDetector {
-	return &AnomalyDetector{
+	d := &AnomalyDetector{
 		cfg:             triggersCfg,
 		cooldown:        time.Duration(cooldownSeconds) * time.Second,
 		maxKeys:         detectorCfg.MaxTrackedKeys,
@@ -70,6 +70,14 @@ func NewAnomalyDetector(triggersCfg config.TriggersConfig, cooldownSeconds int, 
 		dropRates:       make(map[string]*rateWindow),
 		dnsRates:        make(map[string]*rateWindow),
 	}
+	// Pre-seed the per-map tracked-keys gauge so the series appears on
+	// /metrics immediately, not only after the first janitor tick (which
+	// can be up to janitorIntervalSeconds away). Prometheus vector metrics
+	// only materialize labels once WithLabelValues has been called.
+	for _, name := range []string{"http_rates", "drop_rates", "dns_rates", "latencies", "last_capture"} {
+		metrics.TrackedKeys.WithLabelValues(name).Set(0)
+	}
+	return d
 }
 
 // Captures returns a read-only channel of capture requests.
