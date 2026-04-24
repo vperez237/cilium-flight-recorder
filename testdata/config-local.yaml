@@ -1,0 +1,30 @@
+cluster: docker-local
+s3Bucket: flight-recorder-pcaps
+s3Region: us-east-1
+s3Endpoint: http://minio:9000
+hubbleAddress: mock-hubble:4245
+ciliumSocketPath: /var/run/cilium/cilium.sock
+
+triggers:
+  httpErrors:
+    enabled: true
+    statusCodes: [500, 502, 503, 504]
+  drops:
+    enabled: true
+  dnsFailures:
+    enabled: true
+    rcodes: [NXDOMAIN, SERVFAIL, REFUSED]
+  latency:
+    enabled: true
+    thresholdMs: 2000
+    windowSize: 10
+
+capture:
+  defaultDurationSeconds: 10
+  maxSizeBytes: 10485760
+  maxConcurrent: 3
+  cooldownSeconds: 30
+  pcapSourceDir: /data/recorder
+
+server:
+  port: 8080

@@ -1,0 +1,41 @@
+Flight Recorder has been installed in namespace "{{ .Release.Namespace }}".
+
+The DaemonSet runs one pod per node, each watching Hubble flows for anomalies
+and capturing PCAPs when triggers fire.
+
+1. Check rollout status:
+
+   kubectl -n {{ .Release.Namespace }} rollout status ds/{{ include "flight-recorder.fullname" . }}
+
+2. Tail logs (anomaly detection + capture events):
+
+   kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/name={{ include "flight-recorder.name" . }} -f
+
+3. Port-forward to one pod and trigger a manual capture:
+
+   POD=$(kubectl -n {{ .Release.Namespace }} get pod -l app.kubernetes.io/name={{ include "flight-recorder.name" . }} -o name | head -1)
+   kubectl -n {{ .Release.Namespace }} port-forward $POD {{ .Values.server.port }}:{{ .Values.server.port }} &
+
+   curl -X POST http://localhost:{{ .Values.server.port }}/capture \
+     -H "Content-Type: application/json" \
+     -d '{"srcCIDR":"10.0.0.0/8","dstCIDR":"10.0.0.0/8","dstPort":8080,"durationSeconds":30}'
+
+4. List recent captures:
+
+   curl http://localhost:{{ .Values.server.port }}/captures | jq .
+
+5. Captures are uploaded to s3://{{ .Values.s3.bucket }}/{{ .Values.cluster.name }}/<node>/<date>/...
+
+Trigger modes currently enabled:
+{{- if .Values.triggers.httpErrors.enabled }}
+  - HTTP errors:  mode={{ .Values.triggers.httpErrors.mode }}{{ if eq .Values.triggers.httpErrors.mode "rate" }} (>{{ .Values.triggers.httpErrors.rateThreshold }} over {{ .Values.triggers.httpErrors.windowSeconds }}s){{ end }}
+{{- end }}
+{{- if .Values.triggers.drops.enabled }}
+  - Packet drops: mode={{ .Values.triggers.drops.mode }}{{ if eq .Values.triggers.drops.mode "rate" }} (>={{ .Values.triggers.drops.minDrops }} drops per {{ .Values.triggers.drops.windowSeconds }}s){{ end }}
+{{- end }}
+{{- if .Values.triggers.dnsFailures.enabled }}
+  - DNS failures: mode={{ .Values.triggers.dnsFailures.mode }}{{ if eq .Values.triggers.dnsFailures.mode "rate" }} (>{{ .Values.triggers.dnsFailures.rateThreshold }} over {{ .Values.triggers.dnsFailures.windowSeconds }}s){{ end }}
+{{- end }}
+{{- if .Values.triggers.latency.enabled }}
+  - Latency: P99 > {{ .Values.triggers.latency.thresholdMs }}ms
+{{- end }}

@@ -1,0 +1,49 @@
+# Example per-cluster overlay. Copy this to values-<your-cluster>.yaml and
+# change the cluster-specific settings below.
+#
+# Usage:
+#   helm upgrade --install flight-recorder ./helm \
+#     -n kube-system \
+#     -f helm/values-example.yaml
+
+cluster:
+  name: example-cluster
+
+s3:
+  bucket: flight-recorder-pcaps
+  region: us-east-1
+
+image:
+  # Replace with your own built image.
+  repository: ghcr.io/vperez237/flight-recorder
+  tag: v0.1.0
+
+serviceAccount:
+  annotations:
+    # Replace <account> and <role> with values for your IRSA setup.
+    eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>
+
+# Rate-based triggers tuned for a development cluster where occasional 5xx
+# is normal but a sustained spike indicates a real problem.
+triggers:
+  httpErrors:
+    mode: rate
+    minEvents: 20
+    rateThreshold: 0.10     # 10% 5xx
+    windowSeconds: 60
+
+  drops:
+    mode: rate
+    minDrops: 10            # 10 drops to the same dst within the window
+    windowSeconds: 60
+
+  dnsFailures:
+    mode: rate
+    minEvents: 15
+    rateThreshold: 0.15     # 15% DNS failures from one source
+    windowSeconds: 120
+
+  latency:
+    enabled: true
+    thresholdMs: 3000       # 3s P99 is a real problem in dev
+    windowSize: 100

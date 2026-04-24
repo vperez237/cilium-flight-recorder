@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "flight-recorder.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "flight-recorder.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    cluster: {{ .Values.cluster.name }}
+    s3Bucket: {{ .Values.s3.bucket }}
+    s3Region: {{ .Values.s3.region }}
+    {{- if .Values.s3.endpoint }}
+    s3Endpoint: {{ .Values.s3.endpoint }}
+    {{- end }}
+    hubbleAddress: {{ .Values.hubble.address }}
+    ciliumSocketPath: {{ .Values.cilium.socketPath }}
+
+    triggers:
+      httpErrors:
+        enabled: {{ .Values.triggers.httpErrors.enabled }}
+        statusCodes: {{ toJson .Values.triggers.httpErrors.statusCodes }}
+        mode: {{ .Values.triggers.httpErrors.mode | quote }}
+        minEvents: {{ .Values.triggers.httpErrors.minEvents }}
+        rateThreshold: {{ .Values.triggers.httpErrors.rateThreshold }}
+        windowSeconds: {{ .Values.triggers.httpErrors.windowSeconds }}
+      drops:
+        enabled: {{ .Values.triggers.drops.enabled }}
+        mode: {{ .Values.triggers.drops.mode | quote }}
+        minDrops: {{ .Values.triggers.drops.minDrops }}
+        windowSeconds: {{ .Values.triggers.drops.windowSeconds }}
+      dnsFailures:
+        enabled: {{ .Values.triggers.dnsFailures.enabled }}
+        rcodes: {{ toJson .Values.triggers.dnsFailures.rcodes }}
+        mode: {{ .Values.triggers.dnsFailures.mode | quote }}
+        minEvents: {{ .Values.triggers.dnsFailures.minEvents }}
+        rateThreshold: {{ .Values.triggers.dnsFailures.rateThreshold }}
+        windowSeconds: {{ .Values.triggers.dnsFailures.windowSeconds }}
+      latency:
+        enabled: {{ .Values.triggers.latency.enabled }}
+        thresholdMs: {{ .Values.triggers.latency.thresholdMs }}
+        windowSize: {{ .Values.triggers.latency.windowSize }}
+
+    capture:
+      defaultDurationSeconds: {{ .Values.capture.defaultDurationSeconds }}
+      maxSizeBytes: {{ int64 .Values.capture.maxSizeBytes }}
+      maxConcurrent: {{ .Values.capture.maxConcurrent }}
+      cooldownSeconds: {{ .Values.capture.cooldownSeconds }}
+
+    detector:
+      maxTrackedKeys: {{ .Values.detector.maxTrackedKeys }}
+      idleEvictAfterSeconds: {{ .Values.detector.idleEvictAfterSeconds }}
+      janitorIntervalSeconds: {{ .Values.detector.janitorIntervalSeconds }}
+
+    upload:
+      maxAttempts: {{ .Values.upload.maxAttempts }}
+      initialBackoffMs: {{ .Values.upload.initialBackoffMs }}
+      maxBackoffMs: {{ .Values.upload.maxBackoffMs }}
+
+    server:
+      port: {{ .Values.server.port }}

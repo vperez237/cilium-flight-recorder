@@ -1,0 +1,217 @@
+# Default values for flight-recorder.
+
+# -- Override chart name (defaults to "flight-recorder")
+nameOverride: ""
+# -- Override the fully qualified app name (<release>-<chart>)
+fullnameOverride: ""
+
+image:
+  # -- Container image reference. Override this with the registry/repo where
+  # -- you publish your own build (ECR, GHCR, Docker Hub, etc.).
+  repository: ghcr.io/vperez237/flight-recorder
+  tag: ""  # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# -- EKS cluster name, embedded in S3 keys and capture metadata
+cluster:
+  name: example-cluster
+
+s3:
+  # -- S3 bucket for PCAP uploads (must exist and be writable by the IRSA role)
+  bucket: flight-recorder-pcaps
+  region: us-east-1
+  # -- Optional custom S3 endpoint (e.g. http://minio:9000 for local MinIO)
+  endpoint: ""
+
+hubble:
+  # -- gRPC endpoint of Hubble Relay
+  address: hubble-relay.kube-system.svc:4245
+
+cilium:
+  # -- Path to the Cilium agent Unix socket on the node
+  socketPath: /var/run/cilium/cilium.sock
+  # -- Path to the BPF filesystem mount on the node
+  bpfPath: /sys/fs/bpf
+
+# --------------------------------------------------------------------------
+# Anomaly triggers — each supports `immediate` (fire on every event) or
+# `rate` (fire only when the error rate exceeds a threshold over a window).
+# --------------------------------------------------------------------------
+triggers:
+  # -- HTTP 5xx detection (L7 flow.http.code)
+  httpErrors:
+    enabled: true
+    # -- Status codes that count as errors
+    statusCodes: [500, 502, 503, 504]
+    # -- "immediate" fires on every matching flow; "rate" fires when the
+    # -- error rate over `windowSeconds` exceeds `rateThreshold`
+    mode: immediate
+    # -- Minimum HTTP events per (dstIP:dstPort) before rate is evaluated
+    minEvents: 10
+    # -- Error rate threshold (0.0-1.0), e.g. 0.05 = 5%
+    rateThreshold: 0.05
+    # -- Rolling window for rate computation
+    windowSeconds: 60
+
+  # -- Dropped packet detection (flow.verdict == DROPPED)
+  drops:
+    enabled: true
+    mode: immediate
+    # -- Rate-mode: minimum drops per (dstIP:dstPort) within `windowSeconds`
+    minDrops: 5
+    windowSeconds: 60
+
+  # -- DNS failure detection (NXDOMAIN, SERVFAIL, REFUSED)
+  dnsFailures:
+    enabled: true
+    rcodes: [NXDOMAIN, SERVFAIL, REFUSED]
+    mode: immediate
+    # -- Rate-mode: minimum DNS queries per source IP before rate is evaluated
+    minEvents: 10
+    rateThreshold: 0.10
+    windowSeconds: 60
+
+  # -- P99 latency spike detection (L7 flow.latency_ns)
+  latency:
+    enabled: true
+    # -- Threshold in milliseconds; P99 above this triggers a capture
+    thresholdMs: 2000
+    # -- Number of samples in the per-tuple sliding window
+    windowSize: 100
+
+# --------------------------------------------------------------------------
+# Capture configuration
+# --------------------------------------------------------------------------
+capture:
+  # -- Default duration of a capture (manual captures may override)
+  defaultDurationSeconds: 60
+  # -- Hard cap on a single PCAP's size in bytes (100MB default)
+  maxSizeBytes: 104857600
+  # -- Maximum concurrent captures per node
+  maxConcurrent: 3
+  # -- Per-tuple cooldown preventing capture storms (seconds)
+  cooldownSeconds: 300
+
+server:
+  # -- Port for the HTTP API (manual captures, listing, health)
+  port: 8080
+
+# --------------------------------------------------------------------------
+# Detector memory bounds — a background janitor evicts idle per-tuple
+# bookkeeping to keep memory usage bounded in busy clusters.
+# --------------------------------------------------------------------------
+detector:
+  # -- Soft cap on entries per map (rate/latency/cooldown). Oldest entries
+  # -- are evicted once this is exceeded.
+  maxTrackedKeys: 10000
+  # -- Entries idle longer than this are evicted on the next sweep
+  idleEvictAfterSeconds: 600
+  # -- How often the janitor runs
+  janitorIntervalSeconds: 60
+
+# --------------------------------------------------------------------------
+# S3 upload retry policy. Transient failures are retried with jittered
+# exponential backoff; PCAPs that exhaust all attempts are kept on local
+# disk for out-of-band recovery.
+# --------------------------------------------------------------------------
+upload:
+  maxAttempts: 5
+  initialBackoffMs: 500
+  maxBackoffMs: 30000
+
+# --------------------------------------------------------------------------
+# Kubernetes resources
+# --------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""  # defaults to the fullname
+  # -- Annotations for the ServiceAccount. Set the IRSA role ARN here when
+  # -- deploying to EKS; the role must grant s3:PutObject on the target bucket.
+  annotations: {}
+  # Example (replace <account> and <role>):
+  #   eks.amazonaws.com/role-arn: "arn:aws:iam::<account>:role/<role>"
+
+rbac:
+  create: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+# -- Labels applied to the DaemonSet pods (in addition to the default labels)
+podLabels: {}
+
+# -- Annotations applied to the DaemonSet pods (Prometheus scrape annotations
+# -- are enabled by default so /metrics is picked up by the standard scraper)
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+
+# -- Run on all nodes by default; override to restrict to a subset
+nodeSelector: {}
+
+# -- Tolerate all taints so the DaemonSet runs on every node
+tolerations:
+  - operator: Exists
+
+affinity: {}
+
+priorityClassName: ""
+
+terminationGracePeriodSeconds: 30
+
+# -- Size of the emptyDir used to stage PCAPs before S3 upload
+tmpDirSize: 500Mi
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 30
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+# -- Optional ClusterIP Service exposing the HTTP API (useful for /captures
+# -- listing from other pods; manual captures always hit the local pod)
+service:
+  enabled: false
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# --------------------------------------------------------------------------
+# Security context — flight-recorder runs unprivileged. It only needs
+# read-only access to the host BPF filesystem and the Cilium agent socket.
+# --------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# -- Additional environment variables for the flight-recorder container
+extraEnv: []
+# - name: LOG_LEVEL
+#   value: debug

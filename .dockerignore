@@ -1,0 +1,8 @@
+bin/
+.git/
+*.md
+deploy/
+testdata/
+.dockerignore
+docker-compose.yaml
+Makefile
