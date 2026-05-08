@@ -24,7 +24,8 @@ and capturing PCAPs when triggers fire.
 
    curl http://localhost:{{ .Values.server.port }}/captures | jq .
 
-5. Captures are uploaded to s3://{{ .Values.s3.bucket }}/{{ .Values.cluster.name }}/<node>/<date>/...
+5. Captures are uploaded to {{ .Values.storage.url }}, keyed
+   {{ .Values.cluster.name }}/<node>/YYYY/MM/DD/<filename>.pcap
 
 Trigger modes currently enabled:
 {{- if .Values.triggers.httpErrors.enabled }}

@@ -1,7 +1,6 @@
 cluster: docker-local
-s3Bucket: flight-recorder-pcaps
-s3Region: us-east-1
-s3Endpoint: http://minio:9000
+storage:
+  url: "s3://flight-recorder-pcaps?region=us-east-1&endpoint=http://minio:9000&s3ForcePathStyle=true&disableSSL=true&awssdk=v2"
 hubbleAddress: mock-hubble:4245
 ciliumSocketPath: /var/run/cilium/cilium.sock
 

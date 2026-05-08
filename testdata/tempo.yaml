@@ -1,0 +1,35 @@
+# Minimal local-dev Tempo config. Receives OTLP/gRPC on :4317 (matching the
+# port flight-recorder writes to via tracing.endpoint=tempo:4317), keeps
+# blocks on the local filesystem, and exposes the query API on :3200 for
+# Grafana to read.
+#
+# Not suitable for production: no replication, no compaction settings tuned,
+# unauthenticated. For real deploys, run Tempo behind the Grafana
+# Helm chart with object storage backing.
+
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  max_block_duration: 5m   # cut blocks fast so traces show up quickly in dev
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+compactor:
+  compaction:
+    block_retention: 1h    # local-only, keep this short

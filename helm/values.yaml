@@ -16,16 +16,30 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
-# -- EKS cluster name, embedded in S3 keys and capture metadata
+# -- Cluster name, embedded in object keys and capture metadata.
 cluster:
   name: example-cluster
 
-s3:
-  # -- S3 bucket for PCAP uploads (must exist and be writable by the IRSA role)
-  bucket: flight-recorder-pcaps
-  region: us-east-1
-  # -- Optional custom S3 endpoint (e.g. http://minio:9000 for local MinIO)
-  endpoint: ""
+# --------------------------------------------------------------------------
+# Object storage destination. The URL picks the cloud provider — the
+# flight-recorder uses gocloud.dev/blob to dispatch to the right SDK.
+#
+# Supported schemes:
+#   s3://<bucket>?region=<region>                       AWS S3 (IRSA)
+#   s3://<bucket>?region=<region>&endpoint=<url>...     S3-compatible (MinIO, etc.)
+#   gs://<bucket>                                       Google Cloud Storage (Workload Identity)
+#   azblob://<container>?domain=blob.core.windows.net   Azure Blob (Workload Identity)
+#
+# Authentication uses each cloud's default credential chain:
+#   - AWS:    IRSA-injected env vars (AWS_ROLE_ARN, AWS_WEB_IDENTITY_TOKEN_FILE)
+#   - GCP:    GKE Workload Identity binding on the ServiceAccount
+#   - Azure:  AKS Workload Identity (AZURE_TENANT_ID, AZURE_CLIENT_ID,
+#             AZURE_FEDERATED_TOKEN_FILE auto-injected by the AKS mutator)
+#
+# See README.md "Prerequisites" for per-cloud setup commands.
+# --------------------------------------------------------------------------
+storage:
+  url: "s3://flight-recorder-pcaps?region=us-east-1"
 
 hubble:
   # -- gRPC endpoint of Hubble Relay

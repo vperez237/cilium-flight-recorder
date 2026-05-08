@@ -14,9 +14,7 @@ const (
 
 type Config struct {
 	Cluster          string         `yaml:"cluster"`
-	S3Bucket         string         `yaml:"s3Bucket"`
-	S3Region         string         `yaml:"s3Region"`
-	S3Endpoint       string         `yaml:"s3Endpoint"`
+	Storage          StorageConfig  `yaml:"storage"`
 	HubbleAddress    string         `yaml:"hubbleAddress"`
 	CiliumSocketPath string         `yaml:"ciliumSocketPath"`
 	Triggers         TriggersConfig `yaml:"triggers"`
@@ -26,6 +24,17 @@ type Config struct {
 	Upload           UploadConfig   `yaml:"upload"`
 	Cilium           CiliumConfig   `yaml:"cilium"`
 	Tracing          TracingConfig  `yaml:"tracing"`
+}
+
+// StorageConfig points at the destination object store via a
+// gocloud.dev/blob URL. Examples:
+//
+//	s3://my-pcaps?region=us-east-1                           (AWS S3 + IRSA)
+//	s3://my-pcaps?region=us-east-1&endpoint=http://minio:9000&s3ForcePathStyle=true&disableSSL=true&awssdk=v2  (MinIO)
+//	gs://my-pcaps                                            (Google Cloud Storage + Workload Identity)
+//	azblob://my-pcaps?domain=blob.core.windows.net           (Azure Blob + Workload Identity)
+type StorageConfig struct {
+	URL string `yaml:"url"`
 }
 
 // DetectorConfig tunes the per-tuple bookkeeping inside AnomalyDetector.
@@ -152,8 +161,8 @@ func (c *Config) Validate() error {
 	if c.Cluster == "" {
 		return fmt.Errorf("cluster must be set")
 	}
-	if c.S3Bucket == "" {
-		return fmt.Errorf("s3Bucket must be set")
+	if c.Storage.URL == "" {
+		return fmt.Errorf("storage.url must be set (e.g. s3://my-bucket?region=us-east-1, gs://my-bucket, azblob://my-bucket)")
 	}
 	if c.HubbleAddress == "" {
 		return fmt.Errorf("hubbleAddress must be set")
@@ -275,9 +284,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.CiliumSocketPath == "" {
 		cfg.CiliumSocketPath = "/var/run/cilium/cilium.sock"
-	}
-	if cfg.S3Region == "" {
-		cfg.S3Region = "eu-west-1"
 	}
 	if cfg.Capture.DefaultDurationSeconds == 0 {
 		cfg.Capture.DefaultDurationSeconds = 60

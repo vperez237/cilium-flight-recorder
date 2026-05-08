@@ -8,11 +8,8 @@ metadata:
 data:
   config.yaml: |
     cluster: {{ .Values.cluster.name }}
-    s3Bucket: {{ .Values.s3.bucket }}
-    s3Region: {{ .Values.s3.region }}
-    {{- if .Values.s3.endpoint }}
-    s3Endpoint: {{ .Values.s3.endpoint }}
-    {{- end }}
+    storage:
+      url: {{ required "storage.url must be set (s3://… , gs://… , or azblob://…)" .Values.storage.url | quote }}
     hubbleAddress: {{ .Values.hubble.address }}
     ciliumSocketPath: {{ .Values.cilium.socketPath }}
 

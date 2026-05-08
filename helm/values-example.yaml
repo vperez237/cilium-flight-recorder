@@ -9,9 +9,14 @@
 cluster:
   name: example-cluster
 
-s3:
-  bucket: flight-recorder-pcaps
-  region: us-east-1
+# Object-storage destination. Pick one and comment the others out.
+storage:
+  # AWS S3 + IRSA (most common):
+  url: "s3://flight-recorder-pcaps?region=us-east-1"
+  # Google Cloud Storage + Workload Identity:
+  # url: "gs://flight-recorder-pcaps"
+  # Azure Blob Storage + Workload Identity:
+  # url: "azblob://flight-recorder-pcaps?domain=blob.core.windows.net"
 
 image:
   # Replace with your own built image.
