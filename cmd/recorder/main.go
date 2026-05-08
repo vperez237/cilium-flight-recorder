@@ -72,18 +72,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	uploader, err := storage.NewS3Uploader(ctx, cfg.S3Bucket, cfg.S3Region, cfg.Cluster, cfg.S3Endpoint, cfg.Upload, logger)
+	uploader, err := storage.NewUploader(ctx, cfg.Storage.URL, cfg.Cluster, cfg.Upload, logger)
 	if err != nil {
-		slog.Error("failed to create S3 uploader", "error", err)
+		slog.Error("failed to create uploader", "error", err, "storage_url", cfg.Storage.URL)
 		os.Exit(1)
 	}
+	defer uploader.Close()
 
 	srv := api.NewServer(cfg.Server.Port, cm, healthChecker{hw: hw}, logger)
 
 	slog.Info("starting flight recorder",
 		"cluster", cfg.Cluster,
 		"hubble_address", cfg.HubbleAddress,
-		"s3_bucket", cfg.S3Bucket,
+		"storage_url", cfg.Storage.URL,
 		"api_port", cfg.Server.Port,
 	)
 

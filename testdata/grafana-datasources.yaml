@@ -1,0 +1,13 @@
+# Provisions Tempo as a Grafana data source so the bundled Grafana
+# (http://localhost:3000) can browse traces immediately on first start.
+apiVersion: 1
+datasources:
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: true
+    jsonData:
+      httpMethod: GET
+      tracesToLogs:
+        datasourceUid: ""

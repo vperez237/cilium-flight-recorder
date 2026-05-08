@@ -9,8 +9,8 @@ import (
 func TestLoadConfig(t *testing.T) {
 	content := `
 cluster: example-cluster
-s3Bucket: test-bucket
-s3Region: us-east-1
+storage:
+  url: s3://test-bucket?region=us-east-1
 hubbleAddress: hubble-relay:4245
 ciliumSocketPath: /var/run/cilium/cilium.sock
 
@@ -49,11 +49,8 @@ server:
 	if cfg.Cluster != "example-cluster" {
 		t.Errorf("Cluster = %s, want example-cluster", cfg.Cluster)
 	}
-	if cfg.S3Bucket != "test-bucket" {
-		t.Errorf("S3Bucket = %s, want test-bucket", cfg.S3Bucket)
-	}
-	if cfg.S3Region != "us-east-1" {
-		t.Errorf("S3Region = %s, want us-east-1", cfg.S3Region)
+	if cfg.Storage.URL != "s3://test-bucket?region=us-east-1" {
+		t.Errorf("Storage.URL = %q, want s3://test-bucket?region=us-east-1", cfg.Storage.URL)
 	}
 	if !cfg.Triggers.HTTPErrors.Enabled {
 		t.Error("HTTPErrors should be enabled")
@@ -78,7 +75,8 @@ server:
 func TestLoadConfigDefaults(t *testing.T) {
 	content := `
 cluster: test
-s3Bucket: bucket
+storage:
+  url: s3://bucket
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -94,9 +92,6 @@ s3Bucket: bucket
 	}
 	if cfg.CiliumSocketPath != "/var/run/cilium/cilium.sock" {
 		t.Errorf("default CiliumSocketPath = %s", cfg.CiliumSocketPath)
-	}
-	if cfg.S3Region != "eu-west-1" {
-		t.Errorf("default S3Region = %s", cfg.S3Region)
 	}
 	if cfg.Capture.DefaultDurationSeconds != 60 {
 		t.Errorf("default DefaultDurationSeconds = %d", cfg.Capture.DefaultDurationSeconds)
@@ -138,7 +133,7 @@ func TestLoadConfigInvalidYAML(t *testing.T) {
 
 func TestValidateRejectsInvalidConfig(t *testing.T) {
 	valid := func() *Config {
-		c := &Config{Cluster: "c", S3Bucket: "b"}
+		c := &Config{Cluster: "c", Storage: StorageConfig{URL: "s3://b"}}
 		applyDefaults(c)
 		return c
 	}
@@ -149,7 +144,7 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 		want   string
 	}{
 		{"missing cluster", func(c *Config) { c.Cluster = "" }, "cluster"},
-		{"missing bucket", func(c *Config) { c.S3Bucket = "" }, "s3Bucket"},
+		{"missing storage URL", func(c *Config) { c.Storage.URL = "" }, "storage.url"},
 		{"bad port", func(c *Config) { c.Server.Port = 0 }, "server.port"},
 		{"bad port high", func(c *Config) { c.Server.Port = 70000 }, "server.port"},
 		{"bad duration", func(c *Config) { c.Capture.DefaultDurationSeconds = -1 }, "defaultDurationSeconds"},
@@ -184,7 +179,7 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 }
 
 func TestValidateAcceptsDefaults(t *testing.T) {
-	c := &Config{Cluster: "c", S3Bucket: "b"}
+	c := &Config{Cluster: "c", Storage: StorageConfig{URL: "s3://b"}}
 	applyDefaults(c)
 	if err := c.Validate(); err != nil {
 		t.Fatalf("defaults should validate, got: %v", err)
@@ -193,7 +188,7 @@ func TestValidateAcceptsDefaults(t *testing.T) {
 
 func TestLoadRejectsInvalidConfig(t *testing.T) {
 	// Missing required `cluster` field.
-	content := "s3Bucket: bucket\n"
+	content := "storage:\n  url: s3://bucket\n"
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	os.WriteFile(path, []byte(content), 0o644)

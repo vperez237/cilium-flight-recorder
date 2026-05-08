@@ -122,9 +122,7 @@ All configuration is driven by the Helm chart values. `helm/values.yaml` documen
 | `cluster.name` | `example-cluster` | Cluster identifier (embedded in S3 keys + metadata) |
 | `image.repository` | `ghcr.io/vperez237/flight-recorder` | Container image (override for your registry) |
 | `image.tag` | `v<appVersion>` (e.g. `v0.1.0`) | Image tag. Empty uses the v-prefixed form of the chart's appVersion. |
-| `s3.bucket` | `flight-recorder-pcaps` | Target S3 bucket |
-| `s3.region` | `us-east-1` | AWS region |
-| `s3.endpoint` | `""` | Custom S3 endpoint (MinIO/LocalStack) |
+| `storage.url` | `s3://flight-recorder-pcaps?region=us-east-1` | gocloud.dev/blob URL: `s3://`, `gs://`, or `azblob://` |
 | `hubble.address` | `hubble-relay.kube-system.svc:4245` | Hubble Relay gRPC endpoint |
 | `cilium.socketPath` | `/var/run/cilium/cilium.sock` | Node's Cilium agent socket |
 | `cilium.bpfPath` | `/sys/fs/bpf` | Host BPF filesystem mount |
@@ -201,30 +199,59 @@ make docker-down
 
 ### Local Services
 
+Always-on services:
+
 | Service | Purpose | URL |
 |---|---|---|
 | `flight-recorder` | The application under test | `http://localhost:8080` |
 | `mock-hubble` | Generates fake flows: drops, HTTP 5xx, DNS NXDOMAIN, latency spikes | `localhost:4245` (gRPC) |
 | `mock-cilium` | Simulates Cilium agent recorder API, writes dummy PCAPs | Unix socket |
 | `minio` | S3-compatible storage for captured PCAPs | Console: `http://localhost:9001` |
-| `jaeger` | Receives OTLP traces and shows the capture → upload span tree | UI: `http://localhost:16686` |
+
+Tracing backend (one or the other, picked by docker-compose profile):
+
+| Service | When | URL |
+|---|---|---|
+| `jaeger` | `make docker-up` (default) | UI: `http://localhost:16686` |
+| `tempo` + `grafana` | `make docker-up-tempo` | Grafana: `http://localhost:3000`, Tempo API: `http://localhost:3200` |
 
 MinIO credentials: `minioadmin` / `minioadmin`
 
 ### Viewing Traces
 
-`testdata/config-local.yaml` ships with `tracing.endpoint: jaeger:4317`, so every
-capture automatically emits a span tree to Jaeger. Once `make docker-up` is
-running and the flight-recorder has fired at least one capture:
+The flight-recorder emits OTLP/gRPC traces to whatever endpoint
+`tracing.endpoint` points at. Any OTLP-compatible backend works —
+**Jaeger**, **Grafana Tempo**, **Honeycomb**, **Datadog Agent**, **OTel
+Collector** routing to anywhere — the application code never changes.
+
+`testdata/config-local.yaml` ships with `tracing.endpoint: jaeger:4317` (or
+`tempo:4317` if you swap backend; the port is the same). Once `make
+docker-up` is running and at least one capture has fired:
+
+#### Jaeger (default)
+
+```bash
+make docker-up               # COMPOSE_PROFILES=jaeger by default
+```
 
 1. Open `http://localhost:16686`
-2. Select service **flight-recorder**, then click **Find Traces**
-3. Open a trace to see the span tree:
-   - `capture.execute` (root span, tagged with `trigger`, `src_ip`, `dst_ip`, …)
-     - `cilium.createRecorder` — PUT to the BPF recorder API
-     - `cilium.stopAndCollect` — DELETE + file copy
-   - `s3.Upload` (separate trace per completed capture)
-     - `s3.Upload.attempt` (one child per retry attempt)
+2. Select service **flight-recorder**, then **Find Traces**
+
+#### Grafana Tempo (alternative)
+
+```bash
+make docker-up-tempo         # COMPOSE_PROFILES=tempo
+```
+
+1. Open `http://localhost:3000` (Grafana, anonymous admin)
+2. **Explore** → data source **Tempo** → query `{service.name="flight-recorder"}`
+
+Both render the same span tree:
+- `capture.execute` (root span, tagged with `trigger`, `src_ip`, `dst_ip`, …)
+  - `cilium.createRecorder` — PUT to the BPF recorder API
+  - `cilium.stopAndCollect` — DELETE + file copy
+- `s3.Upload` (separate trace per completed capture)
+  - `s3.Upload.attempt` (one child per retry attempt)
 
 Set `tracing.endpoint: ""` in your own config to disable tracing — the code
 installs a no-op tracer and spans cost effectively nothing.
@@ -289,6 +316,70 @@ make helm-install \
 The flight recorder depends on three pieces of platform plumbing; **all must be in
 place before the DaemonSet will work**.
 
+#### 0. Permissions you (the deployer) need
+
+Distinct from what the running pod needs at runtime — these are what the
+human or pipeline executing the setup commands below must hold:
+
+**Kubernetes (in the target cluster):**
+- `cluster-admin`, *or* explicit rights to create:
+  - `ClusterRole` + `ClusterRoleBinding` (the chart creates one for `pods`/`nodes` read access)
+  - `DaemonSet`, `ServiceAccount`, `ConfigMap`, `Service` in the install namespace (default `kube-system`)
+  - `PrometheusRule` (only if you enable `prometheusRule.enabled`)
+  - `NetworkPolicy` (only if you enable `networkPolicy.enabled`)
+
+**Cloud (one of these depending on the storage backend):**
+
+<table>
+<tr><th>AWS</th><th>GCP</th><th>Azure</th></tr>
+<tr valign="top"><td>
+
+```
+s3:CreateBucket
+s3:PutLifecycleConfiguration
+iam:CreatePolicy
+iam:CreateRole
+iam:AttachRolePolicy
+iam:PassRole          (for IRSA)
+sts:AssumeRoleWithWebIdentity
+                      (used by the pod, not you)
+```
+
+`AdministratorAccess` works; `IAMFullAccess` + `AmazonS3FullAccess` is the targeted equivalent.
+
+</td><td>
+
+```
+storage.buckets.create
+storage.buckets.update
+iam.serviceAccounts.create
+iam.serviceAccounts.setIamPolicy
+storage.buckets.setIamPolicy
+```
+
+The pre-built role `roles/owner` covers everything; targeted alternatives are `roles/iam.serviceAccountAdmin` + `roles/storage.admin`.
+
+</td><td>
+
+```
+Microsoft.Storage/storageAccounts/write
+Microsoft.Storage/storageAccounts/blobServices/containers/write
+Microsoft.ManagedIdentity/userAssignedIdentities/write
+Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/write
+Microsoft.Authorization/roleAssignments/write
+```
+
+Built-in equivalents: `Owner` over the resource group, or `Contributor` + `User Access Administrator`.
+
+</td></tr>
+</table>
+
+If you don't have these and your cloud platform team owns IAM, you'll need
+to hand them the JSON policy / role bindings from the relevant section
+below and have them apply them. The Kubernetes side (`helm install`)
+generally requires less because the chart's footprint stays inside one
+namespace.
+
 #### 1. Cilium with the BPF recorder enabled
 
 The Cilium agent exposes a REST API for the BPF PCAP recorder on its Unix
@@ -324,41 +415,42 @@ If Hubble Relay isn't installed, enable it in your Cilium Helm values
 (`hubble.relay.enabled: true`) and point `hubble.address` in
 `helm/values.yaml` at the resulting Service.
 
-#### 3. S3 bucket + IRSA role (EKS)
+#### 3. Object storage bucket + cloud auth
 
-Captured PCAPs are uploaded to S3 via the default AWS credential chain.
-On EKS the cleanest path is IRSA (IAM Roles for Service Accounts). Create
-the bucket, IAM policy, and role, then annotate the ServiceAccount.
+Captured PCAPs are uploaded via [gocloud.dev/blob](https://gocloud.dev/howto/blob/),
+so the same chart works against AWS S3, Google Cloud Storage, and Azure
+Blob Storage. The `storage.url` Helm value picks the backend; auth uses
+each cloud's default credential chain (IRSA on EKS, Workload Identity on
+GKE/AKS).
 
-**IAM policy** (`flight-recorder-s3.json`):
+<details>
+<summary><b>AWS S3 (EKS + IRSA)</b></summary>
+
+**IAM policy** (`flight-recorder-s3.json`) — write-only, no list/read:
 
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "WritePCAPs",
-      "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:AbortMultipartUpload"
-      ],
-      "Resource": "arn:aws:s3:::flight-recorder-pcaps-prod/*"
-    },
-    {
-      "Sid": "ListForRetry",
-      "Effect": "Allow",
-      "Action": [
-        "s3:ListBucket"
-      ],
-      "Resource": "arn:aws:s3:::flight-recorder-pcaps-prod"
-    }
-  ]
+  "Statement": [{
+    "Sid": "WritePCAPs",
+    "Effect": "Allow",
+    "Action": [
+      "s3:PutObject",
+      "s3:AbortMultipartUpload"
+    ],
+    "Resource": "arn:aws:s3:::flight-recorder-pcaps-prod/*"
+  }]
 }
 ```
 
-**Trust policy** (`flight-recorder-trust.json` — replace the OIDC bits with
-values from `aws eks describe-cluster --name <cluster> --query 'cluster.identity.oidc.issuer'`):
+`s3:PutObject` covers single-shot uploads as well as the
+`CreateMultipartUpload`/`UploadPart`/`CompleteMultipartUpload` triplet that the
+SDK uses for objects > 5 MiB. `s3:AbortMultipartUpload` cleans up failed
+multiparts. Nothing else is needed — the recorder never lists, reads, or
+deletes from the bucket.
+
+**Trust policy** (replace the OIDC bits with values from
+`aws eks describe-cluster --name <cluster> --query 'cluster.identity.oidc.issuer'`):
 
 ```json
 {
@@ -381,31 +473,116 @@ values from `aws eks describe-cluster --name <cluster> --query 'cluster.identity
 }
 ```
 
-**Create the role, attach the policy, set the annotation:**
+**Create everything:**
 
 ```bash
-# Bucket (with a 30-day lifecycle to keep storage cheap)
 aws s3api create-bucket --bucket flight-recorder-pcaps-prod --region us-east-1
 aws s3api put-bucket-lifecycle-configuration \
   --bucket flight-recorder-pcaps-prod \
   --lifecycle-configuration '{"Rules":[{"ID":"expire-pcaps","Status":"Enabled","Filter":{},"Expiration":{"Days":30}}]}'
 
-# IAM
-aws iam create-policy \
-  --policy-name flight-recorder-s3 \
-  --policy-document file://flight-recorder-s3.json
-aws iam create-role \
-  --role-name flight-recorder \
-  --assume-role-policy-document file://flight-recorder-trust.json
-aws iam attach-role-policy \
-  --role-name flight-recorder \
+aws iam create-policy --policy-name flight-recorder-s3 --policy-document file://flight-recorder-s3.json
+aws iam create-role --role-name flight-recorder --assume-role-policy-document file://flight-recorder-trust.json
+aws iam attach-role-policy --role-name flight-recorder \
   --policy-arn arn:aws:iam::<account>:policy/flight-recorder-s3
-
-# In your values-<cluster>.yaml:
-#   serviceAccount:
-#     annotations:
-#       eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/flight-recorder
 ```
+
+**Helm values:**
+
+```yaml
+storage:
+  url: "s3://flight-recorder-pcaps-prod?region=us-east-1"
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/flight-recorder
+```
+
+</details>
+
+<details>
+<summary><b>Google Cloud Storage (GKE + Workload Identity)</b></summary>
+
+```bash
+# Bucket
+gcloud storage buckets create gs://flight-recorder-pcaps-prod \
+  --location=us-central1 --uniform-bucket-level-access
+gcloud storage buckets update gs://flight-recorder-pcaps-prod \
+  --lifecycle-file=<(echo '{"rule":[{"action":{"type":"Delete"},"condition":{"age":30}}]}')
+
+# Google service account
+gcloud iam service-accounts create flight-recorder \
+  --display-name="Cilium Flight Recorder PCAP uploader"
+
+# Permissions on the bucket
+gcloud storage buckets add-iam-policy-binding gs://flight-recorder-pcaps-prod \
+  --member=serviceAccount:flight-recorder@<project>.iam.gserviceaccount.com \
+  --role=roles/storage.objectCreator
+
+# Workload Identity binding to the K8s ServiceAccount
+gcloud iam service-accounts add-iam-policy-binding \
+  flight-recorder@<project>.iam.gserviceaccount.com \
+  --role=roles/iam.workloadIdentityUser \
+  --member="serviceAccount:<project>.svc.id.goog[kube-system/flight-recorder]"
+```
+
+**Helm values:**
+
+```yaml
+storage:
+  url: "gs://flight-recorder-pcaps-prod"
+serviceAccount:
+  annotations:
+    iam.gke.io/gcp-service-account: flight-recorder@<project>.iam.gserviceaccount.com
+```
+
+</details>
+
+<details>
+<summary><b>Azure Blob Storage (AKS + Workload Identity)</b></summary>
+
+Requires Workload Identity to be enabled on the AKS cluster
+(`--enable-workload-identity --enable-oidc-issuer`).
+
+```bash
+# Storage account + container
+az storage account create --name flightrecpcaps --resource-group <rg> \
+  --sku Standard_LRS --location eastus
+az storage container create --account-name flightrecpcaps --name flight-recorder-pcaps-prod
+az storage account management-policy create --account-name flightrecpcaps --resource-group <rg> \
+  --policy '{"rules":[{"name":"expire-pcaps","enabled":true,"type":"Lifecycle","definition":{"actions":{"baseBlob":{"delete":{"daysAfterModificationGreaterThan":30}}},"filters":{"blobTypes":["blockBlob"]}}}]}'
+
+# Managed identity + role
+az identity create --name flight-recorder --resource-group <rg>
+SUBSCRIPTION=$(az account show --query id -o tsv)
+az role assignment create \
+  --assignee $(az identity show -n flight-recorder -g <rg> --query principalId -o tsv) \
+  --role "Storage Blob Data Contributor" \
+  --scope "/subscriptions/$SUBSCRIPTION/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/flightrecpcaps"
+
+# Federated credential — link the managed identity to the K8s ServiceAccount
+OIDC_ISSUER=$(az aks show --resource-group <rg> --name <cluster> --query oidcIssuerProfile.issuerUrl -o tsv)
+az identity federated-credential create \
+  --name flight-recorder --identity-name flight-recorder --resource-group <rg> \
+  --issuer "$OIDC_ISSUER" \
+  --subject "system:serviceaccount:kube-system:flight-recorder"
+```
+
+**Helm values:**
+
+```yaml
+storage:
+  url: "azblob://flight-recorder-pcaps-prod?domain=blob.core.windows.net"
+podLabels:
+  azure.workload.identity/use: "true"
+serviceAccount:
+  annotations:
+    azure.workload.identity/client-id: <managed-identity-client-id>
+extraEnv:
+  - name: AZURE_STORAGE_ACCOUNT
+    value: flightrecpcaps
+```
+
+</details>
 
 ### Verification
 
@@ -643,6 +820,47 @@ both are rewritten by the release workflow from the Git tag.
 Internal Go package layout (`pkg/detector`, `pkg/capture`, etc.) is not
 treated as a stable API — the module isn't intended to be imported by
 external projects.
+
+#### Migrating from v0.1.0 to v0.2.0
+
+The `s3Bucket` / `s3Region` / `s3Endpoint` fields are gone, replaced by a
+single `storage.url`. Translate as follows:
+
+```yaml
+# v0.1.0
+s3:
+  bucket: flight-recorder-pcaps
+  region: us-east-1
+
+# v0.2.0
+storage:
+  url: "s3://flight-recorder-pcaps?region=us-east-1"
+```
+
+If you used a custom endpoint for MinIO/LocalStack:
+
+```yaml
+# v0.1.0
+s3:
+  bucket: my-pcaps
+  region: us-east-1
+  endpoint: http://minio:9000
+
+# v0.2.0
+storage:
+  url: "s3://my-pcaps?region=us-east-1&endpoint=http://minio:9000&s3ForcePathStyle=true&disableSSL=true&awssdk=v2"
+```
+
+Authentication and IAM setup are unchanged for AWS users — IRSA still
+works the same way. The new GCS and Azure paths are documented under
+[Prerequisites](#prerequisites).
+
+**S3 object metadata keys:** hyphenated keys (`src-ip`, `dst-ip`,
+`dst-port`) became underscored (`src_ip`, `dst_ip`, `dst_port`) for
+cross-cloud compatibility — Azure Blob metadata keys must follow C#
+identifier rules and reject hyphens. Any tooling that reads metadata via
+`aws s3api head-object` or `mc stat` should switch to the underscored
+form.
 
 ## API
 

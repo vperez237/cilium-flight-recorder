@@ -55,10 +55,12 @@ services:
 
   # Jaeger all-in-one — receives OTLP spans from the flight-recorder and
   # serves a UI so you can inspect the capture → upload span tree.
+  # Default tracing backend; runs unless you select the `tempo` profile.
   # UI:        http://localhost:16686
   # OTLP gRPC: jaeger:4317 (from inside the compose network)
   jaeger:
     image: jaegertracing/all-in-one:1.62.0
+    profiles: ["jaeger"]
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
@@ -72,6 +74,47 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+
+  # Grafana Tempo — alternative OTLP receiver, opt-in via `--profile tempo`.
+  # Run with:
+  #   docker compose --profile tempo up -d
+  # The config below enables the OTLP gRPC receiver on the same port (4317)
+  # so flight-recorder's tracing.endpoint config is portable between the
+  # two backends.
+  tempo:
+    image: grafana/tempo:2.6.0
+    profiles: ["tempo"]
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./testdata/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "4317:4317"     # OTLP gRPC
+      - "3200:3200"     # Tempo HTTP API (Grafana data-source target)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3200/ready >/dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # Grafana — bundled only with the tempo profile so users can actually
+  # browse traces. Not required: you can also point an existing Grafana at
+  # http://localhost:3200 yourself.
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["tempo"]
+    depends_on:
+      tempo:
+        condition: service_healthy
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./testdata/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/tempo.yaml:ro
+    ports:
+      - "3000:3000"
 
   # The Flight Recorder itself
   flight-recorder:
@@ -104,3 +147,4 @@ volumes:
   minio-data:
   cilium-socket:
   pcap-data:
+  tempo-data:

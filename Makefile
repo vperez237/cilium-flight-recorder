@@ -1,7 +1,12 @@
 .PHONY: build test clean \
-	docker-build docker-up docker-down docker-logs docker-test docker-test-all docker-restart \
+	docker-build docker-up docker-up-tempo docker-down docker-logs docker-test docker-test-all docker-restart \
 	helm-lint helm-template helm-install helm-upgrade helm-uninstall helm-diff \
 	helm-package helm-publish
+
+# Tracing backend selector for the local stack. Override on the command
+# line: make docker-up COMPOSE_PROFILES=tempo
+COMPOSE_PROFILES ?= jaeger
+export COMPOSE_PROFILES
 
 HELM_RELEASE   ?= flight-recorder
 HELM_NAMESPACE ?= kube-system
@@ -23,7 +28,8 @@ test:
 docker-build:
 	docker compose build
 
-# Start the full local environment (MinIO + mocks + flight-recorder)
+# Start the full local environment (MinIO + mocks + flight-recorder).
+# Tracing backend defaults to Jaeger; run `make docker-up-tempo` for Tempo.
 docker-up: docker-build
 	docker compose up -d
 	@echo ""
@@ -31,20 +37,33 @@ docker-up: docker-build
 	@echo "  Flight Recorder API:  http://localhost:8080"
 	@echo "  MinIO Console:        http://localhost:9001  (minioadmin/minioadmin)"
 	@echo "  MinIO S3 API:         http://localhost:9000"
+	@if [ "$(COMPOSE_PROFILES)" = "tempo" ]; then \
+	  echo "  Grafana (Tempo):      http://localhost:3000  (anonymous Admin)"; \
+	  echo "  Tempo API:            http://localhost:3200"; \
+	else \
+	  echo "  Jaeger UI:            http://localhost:16686"; \
+	fi
 	@echo ""
 	@echo "Useful commands:"
 	@echo "  make docker-logs           # tail all logs"
 	@echo "  make docker-test           # quick smoke test"
-	@echo "  make docker-test-all       # full test suite (~75s)"
+	@echo "  make docker-test-all       # full test suite (~85s)"
+	@echo "  make docker-up-tempo       # restart with Tempo+Grafana instead of Jaeger"
 	@echo "  make docker-down           # stop everything"
 
-# Stop and clean up
+# Same as docker-up but selects the Tempo profile (Tempo + Grafana).
+docker-up-tempo:
+	@$(MAKE) docker-up COMPOSE_PROFILES=tempo
+
+# Stop and clean up. `--profile "*"` ensures profile-gated services
+# (jaeger, tempo, grafana) are stopped regardless of which profile was
+# used to start them.
 docker-down:
-	docker compose down -v
+	docker compose --profile "*" down -v
 
 # Restart with a fresh build (clean slate)
 docker-restart:
-	docker compose down -v
+	$(MAKE) docker-down
 	docker compose build
 	docker compose up -d
 
